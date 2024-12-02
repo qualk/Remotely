@@ -7,51 +7,80 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
 import org.lwjgl.glfw.GLFW;
+import java.util.Objects;
 
 public class RemotelyClient implements ClientModInitializer {
 
-    private static KeyBinding openTerminalKeyBinding;
+    private KeyBinding openTerminalKeyBinding;
+    private Process terminalProcess;
+    private TerminalScreen terminalScreen;
 
     @Override
     public void onInitializeClient() {
         System.out.println("Remotely mod initialized on the client.");
 
-        // Register the custom key binding
         openTerminalKeyBinding = KeyBindingHelper.registerKeyBinding(new KeyBinding(
-                "Open Terminal", // The translation key of the keybinding's name
-                InputUtil.Type.KEYSYM, // The type of the keybinding, KEYSYM for keyboard
-                GLFW.GLFW_KEY_Z, // The keycode of the key
-                "Reemotely" // The translation key of the keybinding's category
+                "key.remotely.open_terminal",
+                InputUtil.Type.KEYSYM,
+                GLFW.GLFW_KEY_Z,
+                "category.remotely"
         ));
 
-        // Register a keybinding or GUI opening on the client-side
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (client != null && client.player != null) {
-                // Open the terminal GUI when the custom key binding is pressed
                 if (openTerminalKeyBinding.wasPressed()) {
                     openTerminalGUI(client);
                 }
             }
         });
+
+        Runtime.getRuntime().addShutdownHook(new Thread(this::shutdownTerminal));
     }
 
     private void openTerminalGUI(MinecraftClient client) {
-        // Launch the terminal if not already running
-        if (TerminalScreen.terminalProcess == null || !TerminalScreen.terminalProcess.isAlive()) {
-            launchTerminal();
+        try {
+            if (terminalProcess == null || !terminalProcess.isAlive()) {
+                launchTerminal();
+            }
+
+            if (terminalScreen == null || !Objects.equals(client.currentScreen, terminalScreen)) {
+                terminalScreen = new TerminalScreen(client, terminalProcess, this);
+                client.setScreen(terminalScreen);
+            }
+        } catch (Exception e) {
+            System.err.println("Error opening Terminal GUI: " + e.getMessage());
+            e.printStackTrace();
         }
-        // Open the terminal screen
-        client.setScreen(new TerminalScreen(client, TerminalScreen.terminalProcess));
     }
 
     private void launchTerminal() {
         try {
-            // Launch cmd.exe and run PowerShell
             ProcessBuilder processBuilder = new ProcessBuilder("cmd.exe", "/k", "powershell");
             processBuilder.redirectErrorStream(true);
-            TerminalScreen.terminalProcess = processBuilder.start();
+            terminalProcess = processBuilder.start();
         } catch (Exception e) {
+            System.err.println("Failed to launch terminal process: " + e.getMessage());
             e.printStackTrace();
         }
+    }
+
+    public void shutdownTerminal() {
+        if (terminalProcess != null && terminalProcess.isAlive()) {
+            terminalProcess.destroy();
+            terminalProcess = null;
+        }
+
+        if (terminalScreen != null) {
+            MinecraftClient.getInstance().execute(() -> {
+                if (MinecraftClient.getInstance().currentScreen == terminalScreen) {
+                    MinecraftClient.getInstance().setScreen(null);
+                }
+            });
+            terminalScreen = null;
+        }
+    }
+
+    public void onTerminalScreenClosed() {
+        terminalScreen = null;
     }
 }
