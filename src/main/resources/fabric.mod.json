@@ -1,0 +1,36 @@
+{
+	"schemaVersion": 1,
+	"id": "remotely",
+	"version": "${version}",
+	"name": "Remotely",
+	"description": "SSH and SFTP for Minecraft!",
+	"authors": [
+		"RedxAx", "O7Z11"
+	],
+	"contact": {
+		"Discord": "https://discord.gg/RpuFMMpZCV"
+	},
+	"license": "MIT",
+	"icon": "assets/remotely/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"redxax.oxy.Remotely"
+		],
+		"client": [
+			"redxax.oxy.RemotelyClient"
+		]
+	},
+	"mixins": [
+		"remotely.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.16.3",
+		"minecraft": ">=1.20.4",
+		"java": ">=17",
+		"fabric-api": "*"
+	},
+	"suggests": {
+		"another-mod": "*"
+	}
+}
