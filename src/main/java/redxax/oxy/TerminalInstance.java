@@ -2,6 +2,7 @@ package redxax.oxy;
 
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
+import net.minecraft.text.MutableText;
 import net.minecraft.text.OrderedText;
 import net.minecraft.text.Style;
 import net.minecraft.text.Text;
@@ -32,8 +33,6 @@ public class TerminalInstance {
     private final MinecraftClient minecraftClient;
     private final MultiTerminalScreen parentScreen;
 
-    private final List<String> commandHistory = new ArrayList<>();
-    private int historyIndex = -1;
     private int scrollOffset = 0;
     private int cursorPosition = 0;
     private long lastBlinkTime = 0;
@@ -47,14 +46,20 @@ public class TerminalInstance {
     private static final Pattern ERROR_PATTERN = Pattern.compile("\\[.*?ERROR.*?\\]");
 
     private final UUID terminalId;
-    private static final Path LOG_DIR = Paths.get(System.getProperty("user.dir"), "remotely_logs");
+    private static final Path COMMAND_LOG_DIR = Paths.get(System.getProperty("user.dir"), "remotely_command_logs");
     private final Path commandLogPath;
+
+    private boolean isSelecting = false;
+    private int selectionStartIndex = -1;
+    private int selectionEndIndex = -1;
+
+    private List<LineInfo> lineInfos = new ArrayList<>();
 
     public TerminalInstance(MinecraftClient client, MultiTerminalScreen parent, UUID id) {
         this.minecraftClient = client;
         this.parentScreen = parent;
         this.terminalId = id;
-        this.commandLogPath = LOG_DIR.resolve("commands_" + terminalId.toString() + ".log");
+        this.commandLogPath = COMMAND_LOG_DIR.resolve("commands_" + terminalId.toString() + ".log");
         launchTerminal();
         startReaders();
     }
@@ -106,13 +111,8 @@ public class TerminalInstance {
 
     private synchronized void appendOutput(String text) {
         terminalOutput.append(text);
-        minecraftClient.execute(this::autoScrollIfAtBottom);
-    }
-
-    private void autoScrollIfAtBottom() {
-        if (scrollOffset == 0) {
-            scrollToBottom();
-        }
+        lineInfos.clear();
+        minecraftClient.execute(() -> parentScreen.init());
     }
 
     private int getTotalLines() {
@@ -123,86 +123,119 @@ public class TerminalInstance {
 
     private int getVisibleLines(int terminalHeight) {
         float safeScale = Math.max(scale, MIN_SCALE);
-        return (int) ((terminalHeight - getInputFieldHeight()) / (10 * safeScale));
+        int visibleHeight = Math.max(terminalHeight - getInputFieldHeight(), 1);
+        return Math.max((int) (visibleHeight / (minecraftClient.textRenderer.fontHeight * safeScale)), 1);
     }
 
     private int getInputFieldHeight() {
-        return (int) (20 / Math.max(scale, MIN_SCALE));
+        return minecraftClient.textRenderer.fontHeight + 4;
     }
 
     public void render(DrawContext context, int mouseX, int mouseY, float delta, int screenWidth, int screenHeight, float scale) {
         this.scale = Math.max(MIN_SCALE, Math.min(scale, MAX_SCALE));
+
         int terminalX = 10;
         int terminalY = MultiTerminalScreen.TAB_HEIGHT + 10;
         int terminalWidth = screenWidth - 20;
-        int terminalHeight = screenHeight - terminalY - 40;
+        int terminalHeight = screenHeight - terminalY - 10;
 
         context.fill(terminalX, terminalY, terminalX + terminalWidth, terminalY + terminalHeight, 0xFF000000);
 
         context.getMatrices().push();
+
+        int padding = 5;
+        int textAreaX = terminalX + padding;
+        int textAreaY = terminalY + padding;
+        int textAreaWidth = terminalWidth - 2 * padding;
+        int textAreaHeight = terminalHeight - 2 * padding - getInputFieldHeight();
+
+        context.getMatrices().translate(textAreaX, textAreaY, 0);
         context.getMatrices().scale(this.scale, this.scale, 1.0f);
 
         float currentScale = Math.max(this.scale, MIN_SCALE);
-        int x = (int) (terminalX / currentScale) + 5;
-        int yStart = (int) (terminalY / currentScale) + 5;
-        int maxWidth = (int) ((terminalWidth - 10) / currentScale);
-        int inputFieldHeight = getInputFieldHeight();
+        int scaledWidth = (int) (textAreaWidth / this.scale);
+        int scaledHeight = (int) (textAreaHeight / this.scale);
+        int x = 0;
+        int yStart = 0;
+        int maxWidth = scaledWidth;
 
         synchronized (terminalOutput) {
             String[] lines = terminalOutput.toString().split("\n", -1);
             int totalLines = lines.length;
-            int visibleLines = getVisibleLines(terminalHeight);
+            int visibleLines = getVisibleLines(scaledHeight);
 
             scrollOffset = Math.min(scrollOffset, Math.max(0, totalLines - visibleLines));
 
             int startLine = Math.max(0, totalLines - visibleLines - scrollOffset);
             int endLine = Math.min(totalLines, startLine + visibleLines);
 
+            int globalCharIndex = 0;
+            lineInfos.clear();
+
             for (int i = startLine; i < endLine; i++) {
                 String line = lines[i];
-                List<OrderedText> lineSegments = parseAnsiAndHighlight(line, maxWidth);
-                int currentX = x;
-                for (OrderedText segment : lineSegments) {
-                    context.drawText(minecraftClient.textRenderer, segment, currentX, yStart, 0, false);
-                    currentX += minecraftClient.textRenderer.getWidth(segment);
-                    if (currentX - x > maxWidth) {
+                List<StyleTextPair> segments = parseAnsiAndHighlight(line);
+                List<OrderedText> wrappedLines = wrapStyledText(segments, maxWidth);
+
+                for (OrderedText wrappedLine : wrappedLines) {
+                    int lineHeight = minecraftClient.textRenderer.fontHeight;
+                    int lineStartIndex = globalCharIndex;
+                    int lineLength = wrappedLine.toString().length();
+                    LineInfo lineInfo = new LineInfo(lineStartIndex, lineLength, yStart, lineHeight);
+                    lineInfos.add(lineInfo);
+
+                    if (isTextSelected(lineStartIndex, lineLength)) {
+                        int lineWidth = minecraftClient.textRenderer.getWidth(wrappedLine);
+                        context.fill(x, yStart, x + lineWidth, yStart + lineHeight, 0x80FFFFFF);
+                    }
+                    context.drawText(minecraftClient.textRenderer, wrappedLine, x, yStart, 0xFFFFFFFF, false);
+                    yStart += lineHeight;
+                    globalCharIndex += lineLength;
+                    if (yStart + lineHeight > scaledHeight) {
                         break;
                     }
                 }
-                yStart += 10;
-                if (yStart + 10 > (terminalHeight - inputFieldHeight - 10) / currentScale) {
+                if (yStart + minecraftClient.textRenderer.fontHeight > scaledHeight) {
                     break;
                 }
             }
         }
 
+        context.getMatrices().pop();
+
+        int inputX = terminalX + padding;
+        int inputY = terminalY + terminalHeight - padding - getInputFieldHeight();
         String inputText = "> " + inputBuffer.toString();
-        context.drawText(minecraftClient.textRenderer, Text.literal(inputText), x, (int) ((terminalHeight - inputFieldHeight) / currentScale) + terminalY / (int) scale, 0x4AF626, false);
+        context.drawText(minecraftClient.textRenderer, Text.literal(inputText), inputX, inputY, 0x4AF626, false);
 
         if (System.currentTimeMillis() - lastBlinkTime > 500) {
             cursorVisible = !cursorVisible;
             lastBlinkTime = System.currentTimeMillis();
         }
         if (cursorVisible) {
-            float safeScale = Math.max(scale, MIN_SCALE);
             String beforeCursor = "> " + inputBuffer.substring(0, Math.min(cursorPosition, inputBuffer.length()));
-            int cursorX = x + (int) (minecraftClient.textRenderer.getWidth(beforeCursor) / safeScale);
-            int cursorY = (int) ((terminalHeight - inputFieldHeight) / safeScale) + terminalY / (int) scale;
-            context.fill(cursorX, cursorY, cursorX + 1, cursorY + 10, 0x4AF626);
+            int cursorXPos = inputX + minecraftClient.textRenderer.getWidth(beforeCursor);
+            int cursorYPos = inputY;
+            context.fill(cursorXPos, cursorYPos, cursorXPos + 1, cursorYPos + minecraftClient.textRenderer.fontHeight, 0x4AF626);
         }
-
-        context.getMatrices().pop();
     }
 
-    private List<OrderedText> parseAnsiAndHighlight(String text, int maxWidth) {
-        List<OrderedText> result = new ArrayList<>();
+    private boolean isTextSelected(int lineStartIndex, int lineLength) {
+        if (selectionStartIndex == -1 || selectionEndIndex == -1) {
+            return false;
+        }
+        int selStart = Math.min(selectionStartIndex, selectionEndIndex);
+        int selEnd = Math.max(selectionStartIndex, selectionEndIndex);
+        int lineEndIndex = lineStartIndex + lineLength;
+        return selEnd > lineStartIndex && selStart < lineEndIndex;
+    }
+
+    private List<StyleTextPair> parseAnsiAndHighlight(String text) {
+        List<StyleTextPair> result = new ArrayList<>();
         List<StyleTextPair> styledSegments = parseAnsiCodes(text);
         for (StyleTextPair segment : styledSegments) {
             List<StyleTextPair> highlightedSegments = applyKeywordHighlighting(segment);
-            for (StyleTextPair highlightedSegment : highlightedSegments) {
-                List<OrderedText> wrappedLines = wrapText(highlightedSegment.text, highlightedSegment.style, maxWidth);
-                result.addAll(wrappedLines);
-            }
+            result.addAll(highlightedSegments);
         }
         return result;
     }
@@ -294,43 +327,66 @@ public class TerminalInstance {
         return highlighted;
     }
 
-    private List<OrderedText> wrapText(String text, Style style, int maxWidth) {
-        List<OrderedText> wrapped = new ArrayList<>();
-        if (text.isEmpty()) {
-            wrapped.add(Text.literal("").setStyle(style).asOrderedText());
-            return wrapped;
-        }
-        StringBuilder line = new StringBuilder();
-        Pattern pattern = Pattern.compile("\\S+|\\s+");
-        Matcher matcher = pattern.matcher(text);
-        while (matcher.find()) {
-            String word = matcher.group();
-            String potentialLine = line.length() == 0 ? word : line.toString() + word;
-            if (minecraftClient.textRenderer.getWidth(potentialLine) > maxWidth) {
-                if (line.length() > 0) {
-                    wrapped.add(Text.literal(line.toString()).setStyle(style).asOrderedText());
-                    line = new StringBuilder(word);
-                } else {
-                    for (char c : word.toCharArray()) {
-                        String potentialCharLine = line.toString() + c;
-                        if (minecraftClient.textRenderer.getWidth(potentialCharLine) > maxWidth) {
-                            if (line.length() > 0) {
-                                wrapped.add(Text.literal(line.toString()).setStyle(style).asOrderedText());
-                                line = new StringBuilder(String.valueOf(c));
-                            }
-                        } else {
-                            line.append(c);
-                        }
+    private List<OrderedText> wrapStyledText(List<StyleTextPair> segments, int maxWidth) {
+        List<OrderedText> wrappedLines = new ArrayList<>();
+        List<StyleTextPair> currentLineSegments = new ArrayList<>();
+        int currentLineWidth = 0;
+
+        for (StyleTextPair segment : segments) {
+            String text = segment.text;
+            Style style = segment.style;
+            int index = 0;
+            while (index < text.length()) {
+                int remainingWidth = maxWidth - currentLineWidth;
+                int charsToFit = measureTextToFit(text.substring(index), style, remainingWidth);
+                if (charsToFit == 0) {
+                    if (!currentLineSegments.isEmpty()) {
+                        wrappedLines.add(buildOrderedText(currentLineSegments));
+                        currentLineSegments.clear();
                     }
+                    currentLineWidth = 0;
+                    charsToFit = Math.max(1, measureTextToFit(text.substring(index), style, maxWidth));
                 }
-            } else {
-                line.append(word);
+                String substring = text.substring(index, index + charsToFit);
+                currentLineSegments.add(new StyleTextPair(style, substring));
+                int width = minecraftClient.textRenderer.getWidth(substring);
+                currentLineWidth += width;
+                index += charsToFit;
+
+                if (currentLineWidth >= maxWidth) {
+                    wrappedLines.add(buildOrderedText(currentLineSegments));
+                    currentLineSegments.clear();
+                    currentLineWidth = 0;
+                }
             }
         }
-        if (line.length() > 0) {
-            wrapped.add(Text.literal(line.toString()).setStyle(style).asOrderedText());
+        if (!currentLineSegments.isEmpty()) {
+            wrappedLines.add(buildOrderedText(currentLineSegments));
         }
-        return wrapped;
+        return wrappedLines;
+    }
+
+    private int measureTextToFit(String text, Style style, int maxWidth) {
+        int width = 0;
+        int index = 0;
+        while (index < text.length()) {
+            char c = text.charAt(index);
+            int charWidth = minecraftClient.textRenderer.getWidth(String.valueOf(c));
+            if (width + charWidth > maxWidth) {
+                break;
+            }
+            width += charWidth;
+            index++;
+        }
+        return index;
+    }
+
+    private OrderedText buildOrderedText(List<StyleTextPair> segments) {
+        MutableText lineText = Text.literal("");
+        for (StyleTextPair segment : segments) {
+            lineText.append(Text.literal(segment.text).setStyle(segment.style));
+        }
+        return lineText.asOrderedText();
     }
 
     private int get256ColorRGB(int index) {
@@ -428,6 +484,8 @@ public class TerminalInstance {
     }
 
     public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        boolean ctrlHeld = (modifiers & GLFW.GLFW_MOD_CONTROL) != 0;
+
         if (keyCode == GLFW.GLFW_KEY_ENTER) {
             try {
                 String command = inputBuffer.toString().trim();
@@ -440,38 +498,37 @@ public class TerminalInstance {
                     writer.write(command + "\n");
                     writer.flush();
                 }
-                if (!command.isEmpty() && (commandHistory.isEmpty() || !command.equals(commandHistory.get(commandHistory.size() - 1)))) {
-                    commandHistory.add(command);
-                    historyIndex = commandHistory.size();
+                if (!command.isEmpty() && (parentScreen.commandHistory.isEmpty() || !command.equals(parentScreen.commandHistory.get(parentScreen.commandHistory.size() - 1)))) {
+                    parentScreen.commandHistory.add(command);
+                    parentScreen.historyIndex = parentScreen.commandHistory.size();
                 }
                 inputBuffer.setLength(0);
                 cursorPosition = 0;
                 scrollToBottom();
             } catch (IOException e) {
                 appendOutput("ERROR: " + e.getMessage() + "\n");
-                minecraftClient.execute(this::autoScrollIfAtBottom);
             }
             return true;
         }
 
         if (keyCode == GLFW.GLFW_KEY_UP) {
-            if (historyIndex > 0) {
-                historyIndex--;
+            if (parentScreen.historyIndex > 0) {
+                parentScreen.historyIndex--;
                 inputBuffer.setLength(0);
-                inputBuffer.append(commandHistory.get(historyIndex));
+                inputBuffer.append(parentScreen.commandHistory.get(parentScreen.historyIndex));
                 cursorPosition = inputBuffer.length();
             }
             return true;
         }
 
         if (keyCode == GLFW.GLFW_KEY_DOWN) {
-            if (historyIndex < commandHistory.size() - 1) {
-                historyIndex++;
+            if (parentScreen.historyIndex < parentScreen.commandHistory.size() - 1) {
+                parentScreen.historyIndex++;
                 inputBuffer.setLength(0);
-                inputBuffer.append(commandHistory.get(historyIndex));
+                inputBuffer.append(parentScreen.commandHistory.get(parentScreen.historyIndex));
                 cursorPosition = inputBuffer.length();
             } else {
-                historyIndex = commandHistory.size();
+                parentScreen.historyIndex = parentScreen.commandHistory.size();
                 inputBuffer.setLength(0);
                 cursorPosition = 0;
             }
@@ -487,21 +544,45 @@ public class TerminalInstance {
             return true;
         }
 
+        if (keyCode == GLFW.GLFW_KEY_DELETE) {
+            if (cursorPosition < inputBuffer.length()) {
+                inputBuffer.deleteCharAt(cursorPosition);
+                scrollToBottom();
+            }
+            return true;
+        }
+
         if (keyCode == GLFW.GLFW_KEY_LEFT) {
-            if (cursorPosition > 0) {
-                cursorPosition--;
+            if (ctrlHeld) {
+                cursorPosition = moveCursorLeftWord(cursorPosition);
+            } else {
+                if (cursorPosition > 0) {
+                    cursorPosition--;
+                }
             }
             return true;
         }
 
         if (keyCode == GLFW.GLFW_KEY_RIGHT) {
-            if (cursorPosition < inputBuffer.length()) {
-                cursorPosition++;
+            if (ctrlHeld) {
+                cursorPosition = moveCursorRightWord(cursorPosition);
+            } else {
+                if (cursorPosition < inputBuffer.length()) {
+                    cursorPosition++;
+                }
             }
             return true;
         }
 
-        if (keyCode == GLFW.GLFW_KEY_V && (modifiers & GLFW.GLFW_MOD_CONTROL) != 0) {
+        if (ctrlHeld && keyCode == GLFW.GLFW_KEY_BACKSPACE) {
+            int newCursorPos = moveCursorLeftWord(cursorPosition);
+            inputBuffer.delete(newCursorPos, cursorPosition);
+            cursorPosition = newCursorPos;
+            scrollToBottom();
+            return true;
+        }
+
+        if (keyCode == GLFW.GLFW_KEY_V && ctrlHeld) {
             String clipboard = this.minecraftClient.keyboard.getClipboard();
             inputBuffer.insert(cursorPosition, clipboard);
             cursorPosition += clipboard.length();
@@ -509,13 +590,54 @@ public class TerminalInstance {
             return true;
         }
 
+        if (keyCode == GLFW.GLFW_KEY_C && ctrlHeld) {
+            if (selectionStartIndex != -1 && selectionEndIndex != -1) {
+                String selectedText = getSelectedText();
+                minecraftClient.keyboard.setClipboard(selectedText);
+            }
+            return true;
+        }
+
         return false;
+    }
+
+    private int moveCursorLeftWord(int position) {
+        if (position == 0) return 0;
+        int index = position - 1;
+        while (index > 0 && Character.isWhitespace(inputBuffer.charAt(index))) {
+            index--;
+        }
+        while (index > 0 && !Character.isWhitespace(inputBuffer.charAt(index - 1))) {
+            index--;
+        }
+        return index;
+    }
+
+    private int moveCursorRightWord(int position) {
+        int length = inputBuffer.length();
+        if (position >= length) return length;
+        int index = position;
+        while (index < length && !Character.isWhitespace(inputBuffer.charAt(index))) {
+            index++;
+        }
+        while (index < length && Character.isWhitespace(inputBuffer.charAt(index))) {
+            index++;
+        }
+        return index;
+    }
+
+    private String getSelectedText() {
+        int selStart = Math.min(selectionStartIndex, selectionEndIndex);
+        int selEnd = Math.max(selectionStartIndex, selectionEndIndex);
+        synchronized (terminalOutput) {
+            return terminalOutput.substring(selStart, selEnd);
+        }
     }
 
     private void logCommand(String command) {
         try {
-            if (!Files.exists(LOG_DIR)) {
-                Files.createDirectories(LOG_DIR);
+            if (!Files.exists(COMMAND_LOG_DIR)) {
+                Files.createDirectories(COMMAND_LOG_DIR);
             }
             Files.write(commandLogPath, (command + System.lineSeparator()).getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
         } catch (IOException e) {
@@ -523,13 +645,15 @@ public class TerminalInstance {
         }
     }
 
-    private void scrollToBottom() {
+    void scrollToBottom() {
         scrollOffset = 0;
     }
 
     public void scroll(int direction, int terminalHeight) {
+        int totalLines = getTotalLines();
+        int visibleLines = getVisibleLines(terminalHeight);
         if (direction > 0) {
-            if (scrollOffset < getTotalLines() - getVisibleLines(terminalHeight)) {
+            if (scrollOffset < totalLines - visibleLines) {
                 scrollOffset += SCROLL_STEP;
             }
         } else if (direction < 0) {
@@ -537,9 +661,14 @@ public class TerminalInstance {
                 scrollOffset -= SCROLL_STEP;
             }
         }
+        scrollOffset = Math.max(0, Math.min(scrollOffset, totalLines - visibleLines));
+    }
+
+    public void scrollToTop(int terminalHeight) {
         int totalLines = getTotalLines();
         int visibleLines = getVisibleLines(terminalHeight);
-        scrollOffset = Math.max(0, Math.min(scrollOffset, totalLines - visibleLines));
+        scrollOffset = totalLines - visibleLines;
+        scrollOffset = Math.max(0, scrollOffset);
     }
 
     public void shutdown() {
@@ -570,6 +699,60 @@ public class TerminalInstance {
         }
     }
 
+    public boolean mouseClicked(double mouseX, double mouseY, int button, int screenWidth, int screenHeight, float scale) {
+        int terminalX = 10;
+        int terminalY = MultiTerminalScreen.TAB_HEIGHT + 10;
+        int terminalWidth = screenWidth - 20;
+        int terminalHeight = screenHeight - terminalY - 10 - getInputFieldHeight();
+
+        if (button == GLFW.GLFW_MOUSE_BUTTON_LEFT) {
+            if (mouseX >= terminalX && mouseX <= terminalX + terminalWidth && mouseY >= terminalY && mouseY <= terminalY + terminalHeight) {
+                isSelecting = true;
+                int padding = 5;
+                double scaledMouseX = (mouseX - terminalX - padding) / scale;
+                double scaledMouseY = (mouseY - terminalY - padding) / scale;
+                selectionStartIndex = getCharIndexAtPosition(scaledMouseX, scaledMouseY);
+                selectionEndIndex = selectionStartIndex;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public boolean mouseDragged(double mouseX, double mouseY, int button, double deltaX, double deltaY, int screenWidth, int screenHeight, float scale) {
+        if (isSelecting) {
+            int terminalX = 10;
+            int terminalY = MultiTerminalScreen.TAB_HEIGHT + 10;
+            int padding = 5;
+            double scaledMouseX = (mouseX - terminalX - padding) / scale;
+            double scaledMouseY = (mouseY - terminalY - padding) / scale;
+            selectionEndIndex = getCharIndexAtPosition(scaledMouseX, scaledMouseY);
+            return true;
+        }
+        return false;
+    }
+
+    public boolean mouseReleased(double mouseX, double mouseY, int button, int screenWidth, int screenHeight, float scale) {
+        if (isSelecting) {
+            isSelecting = false;
+            return true;
+        }
+        return false;
+    }
+
+    private int getCharIndexAtPosition(double mouseX, double mouseY) {
+        int y = (int) mouseY;
+        for (LineInfo lineInfo : lineInfos) {
+            if (y >= lineInfo.y && y < lineInfo.y + lineInfo.height) {
+                int x = (int) mouseX;
+                String lineText = terminalOutput.substring(lineInfo.startIndex, lineInfo.startIndex + lineInfo.length);
+                int charIndex = minecraftClient.textRenderer.trimToWidth(lineText, x).length();
+                return lineInfo.startIndex + charIndex;
+            }
+        }
+        return terminalOutput.length();
+    }
+
     private static class StyleTextPair {
         final Style style;
         final String text;
@@ -577,6 +760,20 @@ public class TerminalInstance {
         StyleTextPair(Style style, String text) {
             this.style = style;
             this.text = text;
+        }
+    }
+
+    private static class LineInfo {
+        final int startIndex;
+        final int length;
+        final int y;
+        final int height;
+
+        LineInfo(int startIndex, int length, int y, int height) {
+            this.startIndex = startIndex;
+            this.length = length;
+            this.y = y;
+            this.height = height;
         }
     }
 }

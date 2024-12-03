@@ -38,18 +38,29 @@ public class MultiTerminalScreen extends Screen {
     private int renamingTabIndex = -1;
     private StringBuilder renameBuffer = new StringBuilder();
 
+    private long lastRenameBlinkTime = 0;
+    private boolean renameCursorVisible = true;
+
     private boolean closedViaEscape = false;
 
     private String warningMessage = "";
 
-    private static final Path LOG_DIR = Paths.get(System.getProperty("user.dir"), "remotely_logs");
+    private static final Path TERMINAL_LOG_DIR = Paths.get(System.getProperty("user.dir"), "remotely_terminal_logs");
 
-    public MultiTerminalScreen(MinecraftClient minecraftClient, RemotelyClient remotelyClient) {
+    final List<String> commandHistory = new ArrayList<>();
+    int historyIndex = -1;
+
+    public MultiTerminalScreen(MinecraftClient minecraftClient, RemotelyClient remotelyClient, List<TerminalInstance> terminals, List<String> tabNames) {
         super(Text.literal("Multi Terminal"));
         this.minecraftClient = minecraftClient;
         this.remotelyClient = remotelyClient;
-        this.terminals = new ArrayList<>();
-        this.tabNames = new ArrayList<>();
+        this.terminals = terminals;
+        this.tabNames = tabNames;
+        if (terminals.isEmpty()) {
+            addNewTerminal();
+        }
+        this.activeTerminalIndex = remotelyClient.activeTerminalIndex;
+        this.scale = remotelyClient.scale;
     }
 
     @Override
@@ -59,7 +70,7 @@ public class MultiTerminalScreen extends Screen {
     }
 
     void refreshTabButtons() {
-        this.children().removeIf(child -> child instanceof ButtonWidget && ((ButtonWidget) child).getMessage().getString().startsWith("Tab "));
+        this.clearChildren();
         for (int i = 0; i < terminals.size(); i++) {
             final int index = i;
             String tabName = tabNames.get(i);
@@ -75,30 +86,27 @@ public class MultiTerminalScreen extends Screen {
                     .build();
             this.addDrawableChild(tabButton);
         }
-
-        this.children().removeIf(child -> child instanceof ButtonWidget && ((ButtonWidget) child).getMessage().getString().equals("+"));
-        int addButtonX = 10 + terminals.size() * TAB_WIDTH;
-        this.addDrawableChild(ButtonWidget.builder(Text.literal("+"), button -> {
-                    addNewTerminal();
-                    refreshTabButtons();
-                })
-                .position(addButtonX, 5)
-                .size(ADD_TAB_BUTTON_WIDTH, TAB_HEIGHT - 10)
-                .build());
+        if (terminals.size() < MAX_TABS) {
+            int addButtonX = 10 + terminals.size() * TAB_WIDTH;
+            this.addDrawableChild(ButtonWidget.builder(Text.literal("+"), button -> addNewTerminal())
+                    .position(addButtonX, 5)
+                    .size(ADD_TAB_BUTTON_WIDTH, TAB_HEIGHT - 10)
+                    .build());
+        }
     }
 
-    void addNewTerminal() {
+    private void addNewTerminal() {
         if (terminals.size() >= MAX_TABS) {
             warningMessage = "Maximum of " + MAX_TABS + " tabs reached!";
             minecraftClient.player.sendMessage(Text.literal(warningMessage), false);
             return;
         }
         try {
-            if (!Files.exists(LOG_DIR)) {
-                Files.createDirectories(LOG_DIR);
+            if (!Files.exists(TERMINAL_LOG_DIR)) {
+                Files.createDirectories(TERMINAL_LOG_DIR);
             }
         } catch (IOException e) {
-            warningMessage = "Failed to create log directory!";
+            warningMessage = "Failed to create terminal log directory!";
             minecraftClient.player.sendMessage(Text.literal(warningMessage), false);
             return;
         }
@@ -108,15 +116,16 @@ public class MultiTerminalScreen extends Screen {
         tabNames.add("Tab " + terminals.size());
         activeTerminalIndex = terminals.size() - 1;
         setActiveTerminal(activeTerminalIndex);
+        refreshTabButtons();
     }
 
     private void closeTerminal(int index) {
         if (terminals.size() <= 1) {
-            warningMessage = "At least one terminal must remain open.";
-            minecraftClient.player.sendMessage(Text.literal(warningMessage), false);
+            this.close();
             return;
         }
         TerminalInstance terminal = terminals.get(index);
+        terminal.shutdown();
         terminals.remove(index);
         tabNames.remove(index);
         if (activeTerminalIndex >= terminals.size()) {
@@ -161,7 +170,18 @@ public class MultiTerminalScreen extends Screen {
             context.fill(x, y, x + width, y + height, 0xFFCCCCCC);
             String tabLabel = tabNames.get(i);
             if (isRenaming && renamingTabIndex == i) {
-                context.drawText(minecraftClient.textRenderer, Text.literal(renameBuffer.toString()), x + TAB_PADDING, y + 8, 0x000000, false);
+                String renameText = renameBuffer.toString();
+                context.drawText(minecraftClient.textRenderer, Text.literal(renameText), x + TAB_PADDING, y + 8, 0x000000, false);
+                int textWidth = minecraftClient.textRenderer.getWidth(renameText);
+                int cursorXPos = x + TAB_PADDING + textWidth;
+                int cursorYPos = y + 8;
+                if (System.currentTimeMillis() - lastRenameBlinkTime > 500) {
+                    renameCursorVisible = !renameCursorVisible;
+                    lastRenameBlinkTime = System.currentTimeMillis();
+                }
+                if (renameCursorVisible) {
+                    context.fill(cursorXPos, cursorYPos, cursorXPos + 1, cursorYPos + 9, 0xFF000000);
+                }
             } else {
                 context.drawText(minecraftClient.textRenderer, Text.literal(tabLabel), x + TAB_PADDING, y + 8, 0x000000, false);
             }
@@ -179,7 +199,6 @@ public class MultiTerminalScreen extends Screen {
             if (mouseX >= tabX && mouseX <= tabX + tabWidth && mouseY >= tabY && mouseY <= tabY + tabHeight) {
                 if (button == GLFW.GLFW_MOUSE_BUTTON_LEFT) {
                     setActiveTerminal(i);
-                    refreshTabButtons();
                     return true;
                 } else if (button == GLFW.GLFW_MOUSE_BUTTON_MIDDLE) {
                     closeTerminal(i);
@@ -200,6 +219,13 @@ public class MultiTerminalScreen extends Screen {
             }
         }
 
+        if (!terminals.isEmpty()) {
+            TerminalInstance activeTerminal = terminals.get(activeTerminalIndex);
+            if (activeTerminal.mouseClicked(mouseX, mouseY, button, this.width, this.height, scale)) {
+                return true;
+            }
+        }
+
         return super.mouseClicked(mouseX, mouseY, button);
     }
 
@@ -209,6 +235,28 @@ public class MultiTerminalScreen extends Screen {
         renameBuffer.setLength(0);
         renameBuffer.append(tabNames.get(tabIndex));
         refreshTabButtons();
+    }
+
+    @Override
+    public boolean mouseDragged(double mouseX, double mouseY, int button, double deltaX, double deltaY) {
+        if (!terminals.isEmpty()) {
+            TerminalInstance activeTerminal = terminals.get(activeTerminalIndex);
+            if (activeTerminal.mouseDragged(mouseX, mouseY, button, deltaX, deltaY, this.width, this.height, scale)) {
+                return true;
+            }
+        }
+        return super.mouseDragged(mouseX, mouseY, button, deltaX, deltaY);
+    }
+
+    @Override
+    public boolean mouseReleased(double mouseX, double mouseY, int button) {
+        if (!terminals.isEmpty()) {
+            TerminalInstance activeTerminal = terminals.get(activeTerminalIndex);
+            if (activeTerminal.mouseReleased(mouseX, mouseY, button, this.width, this.height, scale)) {
+                return true;
+            }
+        }
+        return super.mouseReleased(mouseX, mouseY, button);
     }
 
     @Override
@@ -226,7 +274,7 @@ public class MultiTerminalScreen extends Screen {
         } else {
             if (!terminals.isEmpty()) {
                 TerminalInstance activeTerminal = terminals.get(activeTerminalIndex);
-                activeTerminal.scroll((int) verticalAmount, this.height - TAB_HEIGHT - 50);
+                activeTerminal.scroll((int) verticalAmount, this.height - TAB_HEIGHT - 10);
                 return true;
             }
         }
@@ -235,6 +283,53 @@ public class MultiTerminalScreen extends Screen {
 
     @Override
     public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        boolean ctrlHeld = (modifiers & GLFW.GLFW_MOD_CONTROL) != 0;
+
+        if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
+            closedViaEscape = true;
+            this.close();
+            return true;
+        }
+
+        if (keyCode == GLFW.GLFW_KEY_PAGE_UP) {
+            if (!terminals.isEmpty()) {
+                TerminalInstance activeTerminal = terminals.get(activeTerminalIndex);
+                activeTerminal.scrollToTop(this.height - TAB_HEIGHT - 10);
+            }
+            return true;
+        }
+
+        if (keyCode == GLFW.GLFW_KEY_PAGE_DOWN) {
+            if (!terminals.isEmpty()) {
+                TerminalInstance activeTerminal = terminals.get(activeTerminalIndex);
+                activeTerminal.scrollToBottom();
+            }
+            return true;
+        }
+
+        if (keyCode == GLFW.GLFW_KEY_DELETE) {
+            closeTerminal(activeTerminalIndex);
+            return true;
+        }
+
+        if (keyCode == GLFW.GLFW_KEY_GRAVE_ACCENT) {
+            int nextIndex = (activeTerminalIndex + 1) % terminals.size();
+            setActiveTerminal(nextIndex);
+            return true;
+        }
+
+        if (ctrlHeld && keyCode == GLFW.GLFW_KEY_EQUAL) {
+            scale += 0.1f;
+            scale = Math.min(MAX_SCALE, scale);
+            return true;
+        }
+
+        if (ctrlHeld && keyCode == GLFW.GLFW_KEY_MINUS) {
+            scale -= 0.1f;
+            scale = Math.max(MIN_SCALE, scale);
+            return true;
+        }
+
         if (isRenaming) {
             if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
                 isRenaming = false;
@@ -257,12 +352,6 @@ public class MultiTerminalScreen extends Screen {
                 }
                 return true;
             }
-            return true;
-        }
-
-        if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
-            closedViaEscape = true;
-            this.close();
             return true;
         }
 
@@ -312,9 +401,14 @@ public class MultiTerminalScreen extends Screen {
             saveAllTerminals();
             remotelyClient.onMultiTerminalScreenClosed();
         }
+        remotelyClient.activeTerminalIndex = this.activeTerminalIndex;
+        remotelyClient.scale = this.scale;
     }
 
     public void shutdownAllTerminals() {
+        if (terminals.isEmpty()) {
+            return;
+        }
         for (TerminalInstance terminal : terminals) {
             terminal.shutdown();
         }
@@ -324,13 +418,13 @@ public class MultiTerminalScreen extends Screen {
 
     private void saveAllTerminals() {
         try {
-            if (!Files.exists(LOG_DIR)) {
-                Files.createDirectories(LOG_DIR);
+            if (!Files.exists(TERMINAL_LOG_DIR)) {
+                Files.createDirectories(TERMINAL_LOG_DIR);
             }
             for (int i = 0; i < terminals.size(); i++) {
                 TerminalInstance terminal = terminals.get(i);
                 String tabName = tabNames.get(i);
-                terminal.saveTerminalOutput(LOG_DIR.resolve(tabName + ".log"));
+                terminal.saveTerminalOutput(TERMINAL_LOG_DIR.resolve(tabName + ".log"));
             }
         } catch (IOException e) {
             minecraftClient.player.sendMessage(Text.literal("Failed to save terminal logs."), false);

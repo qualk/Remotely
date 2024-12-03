@@ -11,6 +11,8 @@ import org.lwjgl.glfw.GLFW;
 
 import java.nio.file.*;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 
 public class RemotelyClient implements ClientModInitializer {
@@ -18,7 +20,12 @@ public class RemotelyClient implements ClientModInitializer {
     private KeyBinding openTerminalKeyBinding;
     private MultiTerminalScreen multiTerminalScreen;
 
-    private static final Path LOG_DIR = Paths.get(System.getProperty("user.dir"), "remotely_logs");
+    private static final Path TERMINAL_LOG_DIR = Paths.get(System.getProperty("user.dir"), "remotely_terminal_logs");
+
+    List<TerminalInstance> terminals = new ArrayList<>();
+    List<String> tabNames = new ArrayList<>();
+    int activeTerminalIndex = 0;
+    float scale = 1.0f;
 
     @Override
     public void onInitializeClient() {
@@ -44,38 +51,35 @@ public class RemotelyClient implements ClientModInitializer {
 
     private void openMultiTerminalGUI(MinecraftClient client) {
         if (multiTerminalScreen == null || !client.isWindowFocused()) {
-            multiTerminalScreen = new MultiTerminalScreen(client, this);
-            client.setScreen(multiTerminalScreen);
-            loadSavedTerminals();
-            if (multiTerminalScreen.terminals.isEmpty()) {
-                multiTerminalScreen.addNewTerminal();
+            multiTerminalScreen = new MultiTerminalScreen(client, this, terminals, tabNames);
+            if (terminals.isEmpty()) {
+                loadSavedTerminals();
             }
-            multiTerminalScreen.refreshTabButtons();
+            client.setScreen(multiTerminalScreen);
         } else {
-            multiTerminalScreen = new MultiTerminalScreen(client, this);
-            client.setScreen(multiTerminalScreen);
-            loadSavedTerminals();
-            if (multiTerminalScreen.terminals.isEmpty()) {
-                multiTerminalScreen.addNewTerminal();
+            multiTerminalScreen = new MultiTerminalScreen(client, this, terminals, tabNames);
+            if (terminals.isEmpty()) {
+                loadSavedTerminals();
             }
-            multiTerminalScreen.refreshTabButtons();
+            client.setScreen(multiTerminalScreen);
         }
     }
 
     private void loadSavedTerminals() {
-        if (Files.exists(LOG_DIR) && Files.isDirectory(LOG_DIR)) {
-            try (DirectoryStream<Path> stream = Files.newDirectoryStream(LOG_DIR, "*.log")) {
+        if (Files.exists(TERMINAL_LOG_DIR) && Files.isDirectory(TERMINAL_LOG_DIR) && terminals.isEmpty()) {
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(TERMINAL_LOG_DIR, "*.log")) {
                 for (Path entry : stream) {
                     String fileName = entry.getFileName().toString();
                     String tabName = fileName.substring(0, fileName.length() - 4);
                     TerminalInstance terminal = new TerminalInstance(MinecraftClient.getInstance(), multiTerminalScreen, UUID.randomUUID());
                     terminal.loadTerminalOutput(entry);
-                    multiTerminalScreen.terminals.add(terminal);
-                    multiTerminalScreen.tabNames.add(tabName);
+                    terminals.add(terminal);
+                    tabNames.add(tabName);
                 }
-                if (!multiTerminalScreen.terminals.isEmpty()) {
-                    multiTerminalScreen.activeTerminalIndex = multiTerminalScreen.terminals.size() - 1;
+                if (!terminals.isEmpty()) {
+                    multiTerminalScreen.activeTerminalIndex = activeTerminalIndex;
                 }
+                multiTerminalScreen.refreshTabButtons();
             } catch (IOException e) {
                 MinecraftClient.getInstance().player.sendMessage(Text.literal("Failed to load saved terminals."), false);
             }
@@ -83,20 +87,25 @@ public class RemotelyClient implements ClientModInitializer {
     }
 
     public void shutdownAllTerminals() {
+        for (TerminalInstance terminal : terminals) {
+            terminal.shutdown();
+        }
+        terminals.clear();
+        tabNames.clear();
         if (multiTerminalScreen != null) {
             multiTerminalScreen.shutdownAllTerminals();
-            try {
-                if (Files.exists(LOG_DIR) && Files.isDirectory(LOG_DIR)) {
-                    try (DirectoryStream<Path> stream = Files.newDirectoryStream(LOG_DIR)) {
-                        for (Path entry : stream) {
-                            Files.deleteIfExists(entry);
-                        }
+            multiTerminalScreen = null;
+        }
+        try {
+            if (Files.exists(TERMINAL_LOG_DIR) && Files.isDirectory(TERMINAL_LOG_DIR)) {
+                try (DirectoryStream<Path> stream = Files.newDirectoryStream(TERMINAL_LOG_DIR)) {
+                    for (Path entry : stream) {
+                        Files.deleteIfExists(entry);
                     }
                 }
-            } catch (IOException e) {
-                System.out.println("Failed to clear terminal log files.");
             }
-            multiTerminalScreen = null;
+        } catch (IOException e) {
+            System.out.println("Failed to clear terminal log files.");
         }
     }
 
