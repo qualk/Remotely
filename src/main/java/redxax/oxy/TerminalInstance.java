@@ -1,5 +1,6 @@
 package redxax.oxy;
 
+import com.jcraft.jsch.*;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.text.MutableText;
@@ -28,7 +29,7 @@ public class TerminalInstance {
     private Writer writer;
     private final StringBuilder terminalOutput = new StringBuilder();
     private final StringBuilder inputBuffer = new StringBuilder();
-    private final ExecutorService executorService = Executors.newFixedThreadPool(2);
+    private final ExecutorService executorService = Executors.newFixedThreadPool(4);
     private boolean isRunning = true;
     private final MinecraftClient minecraftClient;
     private final MultiTerminalScreen parentScreen;
@@ -54,6 +55,15 @@ public class TerminalInstance {
     private int selectionEndIndex = -1;
 
     private List<LineInfo> lineInfos = new ArrayList<>();
+
+    private Session sshSession;
+    private ChannelShell sshChannel;
+    private BufferedReader sshReader;
+    private Writer sshWriter;
+    private boolean isSSH = false;
+
+    private boolean awaitingPassword = false;
+    private String sshPassword = "";
 
     public TerminalInstance(MinecraftClient client, MultiTerminalScreen parent, UUID id) {
         this.minecraftClient = client;
@@ -205,7 +215,8 @@ public class TerminalInstance {
 
         int inputX = terminalX + padding;
         int inputY = terminalY + terminalHeight - padding - getInputFieldHeight();
-        String inputText = "> " + inputBuffer.toString();
+        String inputPrompt = awaitingPassword ? "Password: " : "> ";
+        String inputText = inputPrompt + inputBuffer.toString();
         context.drawText(minecraftClient.textRenderer, Text.literal(inputText), inputX, inputY, 0x4AF626, false);
 
         if (System.currentTimeMillis() - lastBlinkTime > 500) {
@@ -213,7 +224,7 @@ public class TerminalInstance {
             lastBlinkTime = System.currentTimeMillis();
         }
         if (cursorVisible) {
-            String beforeCursor = "> " + inputBuffer.substring(0, Math.min(cursorPosition, inputBuffer.length()));
+            String beforeCursor = inputPrompt + inputBuffer.substring(0, Math.min(cursorPosition, inputBuffer.length()));
             int cursorXPos = inputX + minecraftClient.textRenderer.getWidth(beforeCursor);
             int cursorYPos = inputY;
             context.fill(cursorXPos, cursorYPos, cursorXPos + 1, cursorYPos + minecraftClient.textRenderer.fontHeight, 0x4AF626);
@@ -474,6 +485,17 @@ public class TerminalInstance {
     }
 
     public boolean charTyped(char chr, int keyCode) {
+        if (awaitingPassword) {
+            if (chr != '\n' && chr != '\r') {
+                sshPassword += chr;
+                inputBuffer.append('*');
+                cursorPosition++;
+                scrollToBottom();
+                return true;
+            }
+            return false;
+        }
+
         if (chr >= 32 && chr != 127) {
             inputBuffer.insert(cursorPosition, chr);
             cursorPosition++;
@@ -486,18 +508,52 @@ public class TerminalInstance {
     public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
         boolean ctrlHeld = (modifiers & GLFW.GLFW_MOD_CONTROL) != 0;
 
+        if (awaitingPassword) {
+            if (keyCode == GLFW.GLFW_KEY_ENTER) {
+                String password = sshPassword;
+                sshPassword = "";
+                inputBuffer.setLength(0);
+                cursorPosition = 0;
+                appendOutput("\n");
+                awaitingPassword = false;
+                connectSSHWithPassword(password);
+                return true;
+            }
+            if (keyCode == GLFW.GLFW_KEY_BACKSPACE) {
+                if (!sshPassword.isEmpty()) {
+                    sshPassword = sshPassword.substring(0, sshPassword.length() - 1);
+                    if (inputBuffer.length() > 0) {
+                        inputBuffer.deleteCharAt(inputBuffer.length() - 1);
+                        cursorPosition--;
+                    }
+                    scrollToBottom();
+                }
+                return true;
+            }
+            return false;
+        }
+
         if (keyCode == GLFW.GLFW_KEY_ENTER) {
             try {
                 String command = inputBuffer.toString().trim();
                 logCommand(command);
-                if (command.equalsIgnoreCase("clear")) {
-                    synchronized (terminalOutput) {
-                        terminalOutput.setLength(0);
-                    }
+
+                if (command.startsWith("ssh ")) {
+                    startSSHConnection(command);
+                } else if (isSSH) {
+                    sshWriter.write(inputBuffer.toString() + "\n");
+                    sshWriter.flush();
                 } else {
-                    writer.write(command + "\n");
-                    writer.flush();
+                    if (command.equalsIgnoreCase("clear")) {
+                        synchronized (terminalOutput) {
+                            terminalOutput.setLength(0);
+                        }
+                    } else {
+                        writer.write(inputBuffer.toString() + "\n");
+                        writer.flush();
+                    }
                 }
+
                 if (!command.isEmpty() && (parentScreen.commandHistory.isEmpty() || !command.equals(parentScreen.commandHistory.get(parentScreen.commandHistory.size() - 1)))) {
                     parentScreen.commandHistory.add(command);
                     parentScreen.historyIndex = parentScreen.commandHistory.size();
@@ -505,7 +561,7 @@ public class TerminalInstance {
                 inputBuffer.setLength(0);
                 cursorPosition = 0;
                 scrollToBottom();
-            } catch (IOException e) {
+            } catch (Exception e) {
                 appendOutput("ERROR: " + e.getMessage() + "\n");
             }
             return true;
@@ -601,6 +657,75 @@ public class TerminalInstance {
         return false;
     }
 
+    private void startSSHConnection(String command) {
+        executorService.submit(() -> {
+            try {
+                appendOutput("Connecting...\n");
+                String[] parts = command.split(" ");
+                if (parts.length < 2) {
+                    appendOutput("Usage: ssh user@host\n");
+                    return;
+                }
+                String userHost = parts[1];
+                String[] userHostParts = userHost.split("@");
+                if (userHostParts.length != 2) {
+                    appendOutput("Invalid SSH command. Use ssh user@host\n");
+                    return;
+                }
+                String user = userHostParts[0];
+                String host = userHostParts[1];
+
+                JSch jsch = new JSch();
+                sshSession = jsch.getSession(user, host, 22);
+                sshSession.setConfig("StrictHostKeyChecking", "no");
+                sshSession.setUserInfo(new SSHUserInfo());
+                awaitingPassword = true;
+                appendOutput("Password: ");
+            } catch (Exception e) {
+                appendOutput("SSH connection failed: " + e.getMessage() + "\n");
+            }
+        });
+    }
+
+    private void connectSSHWithPassword(String password) {
+        executorService.submit(() -> {
+            try {
+                sshSession.setPassword(password);
+                sshSession.connect(10000);
+                sshChannel = (ChannelShell) sshSession.openChannel("shell");
+                sshChannel.setPty(true);
+                sshChannel.connect();
+
+                sshReader = new BufferedReader(new InputStreamReader(sshChannel.getInputStream(), StandardCharsets.UTF_8));
+                sshWriter = new OutputStreamWriter(sshChannel.getOutputStream(), StandardCharsets.UTF_8);
+
+                isSSH = true;
+
+                executorService.submit(this::readSSHOutput);
+
+                appendOutput("Connected.\n");
+            } catch (Exception e) {
+                appendOutput("SSH connection failed: " + e.getMessage() + "\n");
+                isSSH = false;
+                if (sshSession != null && sshSession.isConnected()) {
+                    sshSession.disconnect();
+                }
+            }
+        });
+    }
+
+    private void readSSHOutput() {
+        try {
+            String line;
+            while (isRunning && (line = sshReader.readLine()) != null) {
+                line = line.replace("\u0000", "").replace("\r", "");
+                appendOutput(line + "\n");
+            }
+        } catch (IOException e) {
+            appendOutput("Error reading SSH output: " + e.getMessage() + "\n");
+        }
+    }
+
     private int moveCursorLeftWord(int position) {
         if (position == 0) return 0;
         int index = position - 1;
@@ -630,6 +755,8 @@ public class TerminalInstance {
         int selStart = Math.min(selectionStartIndex, selectionEndIndex);
         int selEnd = Math.max(selectionStartIndex, selectionEndIndex);
         synchronized (terminalOutput) {
+            selStart = Math.max(0, Math.min(selStart, terminalOutput.length()));
+            selEnd = Math.max(0, Math.min(selEnd, terminalOutput.length()));
             return terminalOutput.substring(selStart, selEnd);
         }
     }
@@ -676,6 +803,12 @@ public class TerminalInstance {
         if (terminalProcess != null && terminalProcess.isAlive()) {
             terminalProcess.destroy();
             terminalProcess = null;
+        }
+        if (sshChannel != null && sshChannel.isConnected()) {
+            sshChannel.disconnect();
+        }
+        if (sshSession != null && sshSession.isConnected()) {
+            sshSession.disconnect();
         }
         executorService.shutdownNow();
     }
@@ -774,6 +907,39 @@ public class TerminalInstance {
             this.length = length;
             this.y = y;
             this.height = height;
+        }
+    }
+
+    private class SSHUserInfo implements UserInfo {
+
+        @Override
+        public String getPassword() {
+            return sshPassword;
+        }
+
+        @Override
+        public boolean promptYesNo(String message) {
+            return true;
+        }
+
+        @Override
+        public String getPassphrase() {
+            return null;
+        }
+
+        @Override
+        public boolean promptPassphrase(String message) {
+            return false;
+        }
+
+        @Override
+        public boolean promptPassword(String message) {
+            return true;
+        }
+
+        @Override
+        public void showMessage(String message) {
+            appendOutput(message + "\n");
         }
     }
 }

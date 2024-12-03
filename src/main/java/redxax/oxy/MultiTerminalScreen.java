@@ -1,5 +1,6 @@
 package redxax.oxy;
 
+import com.jcraft.jsch.*;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
