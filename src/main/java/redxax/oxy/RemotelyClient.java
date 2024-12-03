@@ -6,14 +6,19 @@ import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
+import net.minecraft.text.Text;
 import org.lwjgl.glfw.GLFW;
-import java.util.Objects;
+
+import java.nio.file.*;
+import java.io.IOException;
+import java.util.UUID;
 
 public class RemotelyClient implements ClientModInitializer {
 
     private KeyBinding openTerminalKeyBinding;
-    private Process terminalProcess;
-    private TerminalScreen terminalScreen;
+    private MultiTerminalScreen multiTerminalScreen;
+
+    private static final Path LOG_DIR = Paths.get(System.getProperty("user.dir"), "remotely_logs");
 
     @Override
     public void onInitializeClient() {
@@ -29,58 +34,73 @@ public class RemotelyClient implements ClientModInitializer {
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (client != null && client.player != null) {
                 if (openTerminalKeyBinding.wasPressed()) {
-                    openTerminalGUI(client);
+                    openMultiTerminalGUI(client);
                 }
             }
         });
 
-        Runtime.getRuntime().addShutdownHook(new Thread(this::shutdownTerminal));
+        Runtime.getRuntime().addShutdownHook(new Thread(this::shutdownAllTerminals));
     }
 
-    private void openTerminalGUI(MinecraftClient client) {
-        try {
-            if (terminalProcess == null || !terminalProcess.isAlive()) {
-                launchTerminal();
+    private void openMultiTerminalGUI(MinecraftClient client) {
+        if (multiTerminalScreen == null || !client.isWindowFocused()) {
+            multiTerminalScreen = new MultiTerminalScreen(client, this);
+            client.setScreen(multiTerminalScreen);
+            loadSavedTerminals();
+            if (multiTerminalScreen.terminals.isEmpty()) {
+                multiTerminalScreen.addNewTerminal();
             }
-
-            if (terminalScreen == null || !Objects.equals(client.currentScreen, terminalScreen)) {
-                terminalScreen = new TerminalScreen(client, terminalProcess, this);
-                client.setScreen(terminalScreen);
+            multiTerminalScreen.refreshTabButtons();
+        } else {
+            multiTerminalScreen = new MultiTerminalScreen(client, this);
+            client.setScreen(multiTerminalScreen);
+            loadSavedTerminals();
+            if (multiTerminalScreen.terminals.isEmpty()) {
+                multiTerminalScreen.addNewTerminal();
             }
-        } catch (Exception e) {
-            System.err.println("Error opening Terminal GUI: " + e.getMessage());
-            e.printStackTrace();
+            multiTerminalScreen.refreshTabButtons();
         }
     }
 
-    private void launchTerminal() {
-        try {
-            ProcessBuilder processBuilder = new ProcessBuilder("cmd.exe", "/k", "powershell");
-            processBuilder.redirectErrorStream(true);
-            terminalProcess = processBuilder.start();
-        } catch (Exception e) {
-            System.err.println("Failed to launch terminal process: " + e.getMessage());
-            e.printStackTrace();
-        }
-    }
-
-    public void shutdownTerminal() {
-        if (terminalProcess != null && terminalProcess.isAlive()) {
-            terminalProcess.destroy();
-            terminalProcess = null;
-        }
-
-        if (terminalScreen != null) {
-            MinecraftClient.getInstance().execute(() -> {
-                if (MinecraftClient.getInstance().currentScreen == terminalScreen) {
-                    MinecraftClient.getInstance().setScreen(null);
+    private void loadSavedTerminals() {
+        if (Files.exists(LOG_DIR) && Files.isDirectory(LOG_DIR)) {
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(LOG_DIR, "*.log")) {
+                for (Path entry : stream) {
+                    String fileName = entry.getFileName().toString();
+                    String tabName = fileName.substring(0, fileName.length() - 4);
+                    TerminalInstance terminal = new TerminalInstance(MinecraftClient.getInstance(), multiTerminalScreen, UUID.randomUUID());
+                    terminal.loadTerminalOutput(entry);
+                    multiTerminalScreen.terminals.add(terminal);
+                    multiTerminalScreen.tabNames.add(tabName);
                 }
-            });
-            terminalScreen = null;
+                if (!multiTerminalScreen.terminals.isEmpty()) {
+                    multiTerminalScreen.activeTerminalIndex = multiTerminalScreen.terminals.size() - 1;
+                }
+            } catch (IOException e) {
+                MinecraftClient.getInstance().player.sendMessage(Text.literal("Failed to load saved terminals."), false);
+            }
         }
     }
 
-    public void onTerminalScreenClosed() {
-        terminalScreen = null;
+    public void shutdownAllTerminals() {
+        if (multiTerminalScreen != null) {
+            multiTerminalScreen.shutdownAllTerminals();
+            try {
+                if (Files.exists(LOG_DIR) && Files.isDirectory(LOG_DIR)) {
+                    try (DirectoryStream<Path> stream = Files.newDirectoryStream(LOG_DIR)) {
+                        for (Path entry : stream) {
+                            Files.deleteIfExists(entry);
+                        }
+                    }
+                }
+            } catch (IOException e) {
+                System.out.println("Failed to clear terminal log files.");
+            }
+            multiTerminalScreen = null;
+        }
+    }
+
+    public void onMultiTerminalScreenClosed() {
+        multiTerminalScreen = null;
     }
 }

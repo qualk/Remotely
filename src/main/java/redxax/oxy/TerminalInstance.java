@@ -2,37 +2,36 @@ package redxax.oxy;
 
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
-import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.text.OrderedText;
 import net.minecraft.text.Style;
 import net.minecraft.text.Text;
 import net.minecraft.text.TextColor;
-import net.minecraft.client.util.InputUtil;
 import org.lwjgl.glfw.GLFW;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Paths;
+import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-public class TerminalScreen extends Screen {
-    private static final String COMMAND_HISTORY_FILE = "command_history.log";
-    private static final String TERMINAL_OUTPUT_FILE = "terminal_output.log";
-    private static final String CONFIG_FILE = "terminal_config.properties";
-    private final MinecraftClient minecraftClient;
+import static redxax.oxy.MultiTerminalScreen.SCROLL_STEP;
+
+public class TerminalInstance {
+
     private Process terminalProcess;
     private BufferedReader reader;
     private BufferedReader errorReader;
     private Writer writer;
-    private static final StringBuilder terminalOutput = new StringBuilder();
+    private final StringBuilder terminalOutput = new StringBuilder();
     private final StringBuilder inputBuffer = new StringBuilder();
-    private static final ExecutorService executorService = Executors.newFixedThreadPool(2);
-    private static boolean readersStarted = false;
+    private final ExecutorService executorService = Executors.newFixedThreadPool(2);
+    private boolean isRunning = true;
+    private final MinecraftClient minecraftClient;
+    private final MultiTerminalScreen parentScreen;
+
     private final List<String> commandHistory = new ArrayList<>();
     private int historyIndex = -1;
     private int scrollOffset = 0;
@@ -40,131 +39,54 @@ public class TerminalScreen extends Screen {
     private long lastBlinkTime = 0;
     private boolean cursorVisible = true;
     private float scale = 1.0f;
-    private static final float MIN_SCALE = 0.5f;
+    private static final float MIN_SCALE = 0.1f;
     private static final float MAX_SCALE = 2.0f;
-    private Properties configProperties;
-
-    private final RemotelyClient remotelyClient;
 
     private static final Pattern INFO_PATTERN = Pattern.compile("\\[.*?INFO.*?\\]");
     private static final Pattern WARN_PATTERN = Pattern.compile("\\[.*?WARN.*?\\]");
     private static final Pattern ERROR_PATTERN = Pattern.compile("\\[.*?ERROR.*?\\]");
 
-    public TerminalScreen(MinecraftClient minecraftClient, Process terminalProcess, RemotelyClient remotelyClient) {
-        super(Text.literal("Terminal"));
-        this.minecraftClient = minecraftClient;
-        this.terminalProcess = terminalProcess;
-        this.remotelyClient = remotelyClient;
+    private final UUID terminalId;
+    private static final Path LOG_DIR = Paths.get(System.getProperty("user.dir"), "remotely_logs");
+    private final Path commandLogPath;
 
-        loadConfig();
-        loadCommandHistory();
-        loadTerminalOutput();
+    public TerminalInstance(MinecraftClient client, MultiTerminalScreen parent, UUID id) {
+        this.minecraftClient = client;
+        this.parentScreen = parent;
+        this.terminalId = id;
+        this.commandLogPath = LOG_DIR.resolve("commands_" + terminalId.toString() + ".log");
+        launchTerminal();
+        startReaders();
+    }
 
+    private void launchTerminal() {
         try {
-            reader = new BufferedReader(new InputStreamReader(this.terminalProcess.getInputStream(), StandardCharsets.UTF_8));
-            errorReader = new BufferedReader(new InputStreamReader(this.terminalProcess.getErrorStream(), StandardCharsets.UTF_8));
-            writer = new OutputStreamWriter(this.terminalProcess.getOutputStream(), StandardCharsets.UTF_8);
+            ProcessBuilder processBuilder = new ProcessBuilder("cmd.exe", "/k", "powershell");
+            processBuilder.redirectErrorStream(true);
+            terminalProcess = processBuilder.start();
+            reader = new BufferedReader(new InputStreamReader(terminalProcess.getInputStream(), StandardCharsets.UTF_8));
+            errorReader = new BufferedReader(new InputStreamReader(terminalProcess.getErrorStream(), StandardCharsets.UTF_8));
+            writer = new OutputStreamWriter(terminalProcess.getOutputStream(), StandardCharsets.UTF_8);
         } catch (Exception e) {
-            e.printStackTrace();
-        }
-
-        synchronized (TerminalScreen.class) {
-            if (!readersStarted) {
-                executorService.submit(this::readTerminalOutput);
-                executorService.submit(this::readErrorOutput);
-                readersStarted = true;
-            }
-        }
-    }
-
-    private void loadConfig() {
-        configProperties = new Properties();
-        File configFile = new File(CONFIG_FILE);
-        if (configFile.exists()) {
-            try (FileInputStream fis = new FileInputStream(configFile)) {
-                configProperties.load(fis);
-                String scaleStr = configProperties.getProperty("scale");
-                if (scaleStr != null) {
-                    try {
-                        scale = Float.parseFloat(scaleStr);
-                        scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale));
-                    } catch (NumberFormatException e) {
-                        scale = 1.0f;
-                    }
-                }
-            } catch (IOException e) {
-                e.printStackTrace();
-                scale = 1.0f;
-            }
-        } else {
-            configProperties.setProperty("scale", String.valueOf(scale));
-            saveConfig();
-        }
-    }
-
-    private void saveConfig() {
-        try (FileOutputStream fos = new FileOutputStream(CONFIG_FILE)) {
-            configProperties.store(fos, "Terminal Configuration");
-        } catch (IOException e) {
+            appendOutput("Failed to launch terminal process: " + e.getMessage() + "\n");
             e.printStackTrace();
         }
     }
 
-    private void loadCommandHistory() {
-        try {
-            List<String> lines = Files.readAllLines(Paths.get(COMMAND_HISTORY_FILE), StandardCharsets.UTF_8);
-            commandHistory.addAll(lines);
-            historyIndex = commandHistory.size();
-        } catch (IOException e) {
-        }
-    }
-
-    private void saveCommandHistory() {
-        try (BufferedWriter writer = Files.newBufferedWriter(Paths.get(COMMAND_HISTORY_FILE), StandardCharsets.UTF_8)) {
-            for (String command : commandHistory) {
-                writer.write(command);
-                writer.newLine();
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-    }
-
-    private void loadTerminalOutput() {
-        try {
-            List<String> lines = Files.readAllLines(Paths.get(TERMINAL_OUTPUT_FILE), StandardCharsets.UTF_8);
-            synchronized (terminalOutput) {
-                terminalOutput.setLength(0);
-                for (String line : lines) {
-                    terminalOutput.append(line).append("\n");
-                }
-            }
-        } catch (IOException e) {
-        }
-    }
-
-    private void saveTerminalOutput() {
-        synchronized (terminalOutput) {
-            try (BufferedWriter writer = Files.newBufferedWriter(Paths.get(TERMINAL_OUTPUT_FILE), StandardCharsets.UTF_8)) {
-                writer.write(terminalOutput.toString());
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-        }
+    private void startReaders() {
+        executorService.submit(this::readTerminalOutput);
+        executorService.submit(this::readErrorOutput);
     }
 
     private void readTerminalOutput() {
         try {
             String line;
-            while ((line = reader.readLine()) != null) {
+            while (isRunning && (line = reader.readLine()) != null) {
                 line = line.replace("\u0000", "").replace("\r", "");
-                synchronized (terminalOutput) {
-                    terminalOutput.append(line).append("\n");
-                    saveTerminalOutput();
-                }
-                minecraftClient.execute(this::autoScrollIfAtBottom);
+                appendOutput(line + "\n");
             }
-        } catch (Exception e) {
+        } catch (IOException e) {
+            appendOutput("Error reading terminal output: " + e.getMessage() + "\n");
             e.printStackTrace();
         }
     }
@@ -172,17 +94,19 @@ public class TerminalScreen extends Screen {
     private void readErrorOutput() {
         try {
             String line;
-            while ((line = errorReader.readLine()) != null) {
+            while (isRunning && (line = errorReader.readLine()) != null) {
                 line = line.replace("\u0000", "").replace("\r", "");
-                synchronized (terminalOutput) {
-                    terminalOutput.append("ERROR: ").append(line).append("\n");
-                    saveTerminalOutput();
-                }
-                minecraftClient.execute(this::autoScrollIfAtBottom);
+                appendOutput("ERROR: " + line + "\n");
             }
-        } catch (Exception e) {
+        } catch (IOException e) {
+            appendOutput("Error reading terminal error output: " + e.getMessage() + "\n");
             e.printStackTrace();
         }
+    }
+
+    private synchronized void appendOutput(String text) {
+        terminalOutput.append(text);
+        minecraftClient.execute(this::autoScrollIfAtBottom);
     }
 
     private void autoScrollIfAtBottom() {
@@ -197,32 +121,37 @@ public class TerminalScreen extends Screen {
         }
     }
 
-    private int getVisibleLines() {
-        float safeScale = Math.max(scale, 0.1f);
-        return (int) ((this.height - getInputFieldHeight() - 20) / (10 * safeScale));
+    private int getVisibleLines(int terminalHeight) {
+        float safeScale = Math.max(scale, MIN_SCALE);
+        return (int) ((terminalHeight - getInputFieldHeight()) / (10 * safeScale));
     }
 
     private int getInputFieldHeight() {
-        return (int) (20 / scale);
+        return (int) (20 / Math.max(scale, MIN_SCALE));
     }
 
-    @Override
-    public void render(DrawContext context, int mouseX, int mouseY, float delta) {
-        this.renderBackground(context, mouseX, mouseY, delta);
+    public void render(DrawContext context, int mouseX, int mouseY, float delta, int screenWidth, int screenHeight, float scale) {
+        this.scale = Math.max(MIN_SCALE, Math.min(scale, MAX_SCALE));
+        int terminalX = 10;
+        int terminalY = MultiTerminalScreen.TAB_HEIGHT + 10;
+        int terminalWidth = screenWidth - 20;
+        int terminalHeight = screenHeight - terminalY - 40;
+
+        context.fill(terminalX, terminalY, terminalX + terminalWidth, terminalY + terminalHeight, 0xFF000000);
 
         context.getMatrices().push();
-        context.getMatrices().scale(scale, scale, 1.0f);
+        context.getMatrices().scale(this.scale, this.scale, 1.0f);
 
-        float currentScale = Math.max(scale, 0.1f);
-        int x = (int) (10 / currentScale);
-        int yStart = (int) (10 / currentScale);
-        int maxWidth = (int) ((this.width - 20) / currentScale);
+        float currentScale = Math.max(this.scale, MIN_SCALE);
+        int x = (int) (terminalX / currentScale) + 5;
+        int yStart = (int) (terminalY / currentScale) + 5;
+        int maxWidth = (int) ((terminalWidth - 10) / currentScale);
         int inputFieldHeight = getInputFieldHeight();
 
         synchronized (terminalOutput) {
             String[] lines = terminalOutput.toString().split("\n", -1);
             int totalLines = lines.length;
-            int visibleLines = getVisibleLines();
+            int visibleLines = getVisibleLines(terminalHeight);
 
             scrollOffset = Math.min(scrollOffset, Math.max(0, totalLines - visibleLines));
 
@@ -234,43 +163,40 @@ public class TerminalScreen extends Screen {
                 List<OrderedText> lineSegments = parseAnsiAndHighlight(line, maxWidth);
                 int currentX = x;
                 for (OrderedText segment : lineSegments) {
-                    context.drawText(this.textRenderer, segment, currentX, yStart, 0, false);
-                    currentX += this.textRenderer.getWidth(segment);
+                    context.drawText(minecraftClient.textRenderer, segment, currentX, yStart, 0, false);
+                    currentX += minecraftClient.textRenderer.getWidth(segment);
                     if (currentX - x > maxWidth) {
                         break;
                     }
                 }
                 yStart += 10;
-                if (yStart + 10 > (this.height - inputFieldHeight - 20) / currentScale) {
+                if (yStart + 10 > (terminalHeight - inputFieldHeight - 10) / currentScale) {
                     break;
                 }
             }
         }
 
         String inputText = "> " + inputBuffer.toString();
-        context.drawText(this.textRenderer, Text.literal(inputText), x, (int) ((this.height - inputFieldHeight) / currentScale), 0x4AF626, false);
+        context.drawText(minecraftClient.textRenderer, Text.literal(inputText), x, (int) ((terminalHeight - inputFieldHeight) / currentScale) + terminalY / (int) scale, 0x4AF626, false);
 
         if (System.currentTimeMillis() - lastBlinkTime > 500) {
             cursorVisible = !cursorVisible;
             lastBlinkTime = System.currentTimeMillis();
         }
         if (cursorVisible) {
-            float safeScale = Math.max(scale, 0.1f);
+            float safeScale = Math.max(scale, MIN_SCALE);
             String beforeCursor = "> " + inputBuffer.substring(0, Math.min(cursorPosition, inputBuffer.length()));
-            int cursorX = x + (int) (this.textRenderer.getWidth(beforeCursor) / safeScale);
-            int cursorY = (int) ((this.height - inputFieldHeight) / safeScale);
+            int cursorX = x + (int) (minecraftClient.textRenderer.getWidth(beforeCursor) / safeScale);
+            int cursorY = (int) ((terminalHeight - inputFieldHeight) / safeScale) + terminalY / (int) scale;
             context.fill(cursorX, cursorY, cursorX + 1, cursorY + 10, 0x4AF626);
         }
 
         context.getMatrices().pop();
-
-        super.render(context, mouseX, mouseY, delta);
     }
 
     private List<OrderedText> parseAnsiAndHighlight(String text, int maxWidth) {
         List<OrderedText> result = new ArrayList<>();
         List<StyleTextPair> styledSegments = parseAnsiCodes(text);
-
         for (StyleTextPair segment : styledSegments) {
             List<StyleTextPair> highlightedSegments = applyKeywordHighlighting(segment);
             for (StyleTextPair highlightedSegment : highlightedSegments) {
@@ -278,23 +204,19 @@ public class TerminalScreen extends Screen {
                 result.addAll(wrappedLines);
             }
         }
-
         return result;
     }
 
     private List<StyleTextPair> parseAnsiCodes(String text) {
         List<StyleTextPair> segments = new ArrayList<>();
         String[] parts = text.split("\u001B\\[");
-
         Style currentStyle = Style.EMPTY.withColor(TextColor.fromRgb(0xFFFFFF));
-
         for (int i = 0; i < parts.length; i++) {
             String part = parts[i];
             if (i == 0) {
                 segments.add(new StyleTextPair(currentStyle, part));
                 continue;
             }
-
             int mIndex = part.indexOf('m');
             if (mIndex != -1) {
                 String code = part.substring(0, mIndex);
@@ -307,7 +229,6 @@ public class TerminalScreen extends Screen {
                 segments.add(new StyleTextPair(currentStyle, part));
             }
         }
-
         return segments;
     }
 
@@ -321,7 +242,6 @@ public class TerminalScreen extends Screen {
             } catch (NumberFormatException e) {
                 continue;
             }
-
             if (codeNum == 0) {
                 style = Style.EMPTY.withColor(TextColor.fromRgb(0xFFFFFF));
             } else if (codeNum == 38) {
@@ -347,17 +267,14 @@ public class TerminalScreen extends Screen {
         List<StyleTextPair> highlighted = new ArrayList<>();
         String text = segment.text;
         Style style = segment.style;
-
         Pattern combinedPattern = Pattern.compile("\\[.*?INFO.*?\\]|\\[.*?WARN.*?\\]|\\[.*?ERROR.*?\\]");
         Matcher matcher = combinedPattern.matcher(text);
         int lastEnd = 0;
-
         while (matcher.find()) {
             if (matcher.start() > lastEnd) {
                 String before = text.substring(lastEnd, matcher.start());
                 highlighted.add(new StyleTextPair(style, before));
             }
-
             String matched = matcher.group();
             Style keywordStyle = style;
             if (INFO_PATTERN.matcher(matched).matches()) {
@@ -367,16 +284,13 @@ public class TerminalScreen extends Screen {
             } else if (ERROR_PATTERN.matcher(matched).matches()) {
                 keywordStyle = style.withColor(TextColor.fromRgb(0xFF0000));
             }
-
             highlighted.add(new StyleTextPair(keywordStyle, matched));
             lastEnd = matcher.end();
         }
-
         if (lastEnd < text.length()) {
             String remaining = text.substring(lastEnd);
             highlighted.add(new StyleTextPair(style, remaining));
         }
-
         return highlighted;
     }
 
@@ -386,21 +300,20 @@ public class TerminalScreen extends Screen {
             wrapped.add(Text.literal("").setStyle(style).asOrderedText());
             return wrapped;
         }
-
         StringBuilder line = new StringBuilder();
         Pattern pattern = Pattern.compile("\\S+|\\s+");
         Matcher matcher = pattern.matcher(text);
         while (matcher.find()) {
             String word = matcher.group();
             String potentialLine = line.length() == 0 ? word : line.toString() + word;
-            if (this.textRenderer.getWidth(potentialLine) > maxWidth) {
+            if (minecraftClient.textRenderer.getWidth(potentialLine) > maxWidth) {
                 if (line.length() > 0) {
                     wrapped.add(Text.literal(line.toString()).setStyle(style).asOrderedText());
                     line = new StringBuilder(word);
                 } else {
                     for (char c : word.toCharArray()) {
                         String potentialCharLine = line.toString() + c;
-                        if (this.textRenderer.getWidth(potentialCharLine) > maxWidth) {
+                        if (minecraftClient.textRenderer.getWidth(potentialCharLine) > maxWidth) {
                             if (line.length() > 0) {
                                 wrapped.add(Text.literal(line.toString()).setStyle(style).asOrderedText());
                                 line = new StringBuilder(String.valueOf(c));
@@ -414,11 +327,9 @@ public class TerminalScreen extends Screen {
                 line.append(word);
             }
         }
-
         if (line.length() > 0) {
             wrapped.add(Text.literal(line.toString()).setStyle(style).asOrderedText());
         }
-
         return wrapped;
     }
 
@@ -426,7 +337,6 @@ public class TerminalScreen extends Screen {
         if (index < 0 || index > 255) {
             return 0xFFFFFF;
         }
-
         if (index < 16) {
             return getStandardColorRGB(index);
         } else if (index >= 16 && index <= 231) {
@@ -507,7 +417,6 @@ public class TerminalScreen extends Screen {
         }
     }
 
-    @Override
     public boolean charTyped(char chr, int keyCode) {
         if (chr >= 32 && chr != 127) {
             inputBuffer.insert(cursorPosition, chr);
@@ -515,23 +424,18 @@ public class TerminalScreen extends Screen {
             scrollToBottom();
             return true;
         }
-        return super.charTyped(chr, keyCode);
+        return false;
     }
 
-    @Override
     public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
         if (keyCode == GLFW.GLFW_KEY_ENTER) {
             try {
                 String command = inputBuffer.toString().trim();
+                logCommand(command);
                 if (command.equalsIgnoreCase("clear")) {
                     synchronized (terminalOutput) {
                         terminalOutput.setLength(0);
-                        saveTerminalOutput();
                     }
-                } else if (command.equalsIgnoreCase("!exit")) {
-                    remotelyClient.shutdownTerminal();
-                    this.close();
-                    return true;
                 } else {
                     writer.write(command + "\n");
                     writer.flush();
@@ -539,17 +443,12 @@ public class TerminalScreen extends Screen {
                 if (!command.isEmpty() && (commandHistory.isEmpty() || !command.equals(commandHistory.get(commandHistory.size() - 1)))) {
                     commandHistory.add(command);
                     historyIndex = commandHistory.size();
-                    saveCommandHistory();
                 }
                 inputBuffer.setLength(0);
                 cursorPosition = 0;
                 scrollToBottom();
             } catch (IOException e) {
-                e.printStackTrace();
-                synchronized (terminalOutput) {
-                    terminalOutput.append("ERROR: ").append(e.getMessage()).append("\n");
-                    saveTerminalOutput();
-                }
+                appendOutput("ERROR: " + e.getMessage() + "\n");
                 minecraftClient.execute(this::autoScrollIfAtBottom);
             }
             return true;
@@ -610,90 +509,65 @@ public class TerminalScreen extends Screen {
             return true;
         }
 
-        return super.keyPressed(keyCode, scanCode, modifiers);
+        return false;
     }
 
-    @Override
-    public boolean mouseClicked(double mouseX, double mouseY, int button) {
-        if (button == 0) {
-            float safeScale = Math.max(scale, 0.1f);
-            double scaledMouseX = mouseX / scale;
-            double scaledMouseY = mouseY / scale;
-
-            int x = (int) (10 / safeScale);
-            int y = (int) ((this.height - getInputFieldHeight()) / safeScale);
-            int clickX = (int) scaledMouseX - x;
-            int clickY = (int) scaledMouseY - y;
-
-            if (clickY >= 0 && clickY < getInputFieldHeight()) {
-                int charWidth = this.textRenderer.getWidth(" ");
-                charWidth = Math.max(charWidth, 1);
-                cursorPosition = Math.min((int) (clickX / (charWidth / safeScale)), inputBuffer.length());
+    private void logCommand(String command) {
+        try {
+            if (!Files.exists(LOG_DIR)) {
+                Files.createDirectories(LOG_DIR);
             }
+            Files.write(commandLogPath, (command + System.lineSeparator()).getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            appendOutput("Failed to log command: " + e.getMessage() + "\n");
         }
-        return super.mouseClicked(mouseX, mouseY, button);
-    }
-
-    @Override
-    public boolean mouseScrolled(double mouseX, double mouseY, double horizontalAmount, double verticalAmount) {
-        boolean ctrlHeld = InputUtil.isKeyPressed(
-                this.minecraftClient.getWindow().getHandle(),
-                GLFW.GLFW_KEY_LEFT_CONTROL) ||
-                InputUtil.isKeyPressed(this.minecraftClient.getWindow().getHandle(),
-                        GLFW.GLFW_KEY_RIGHT_CONTROL);
-
-        if (ctrlHeld) {
-            scale += verticalAmount > 0 ? 0.1f : -0.1f;
-            scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale));
-            configProperties.setProperty("scale", String.valueOf(scale));
-            saveConfig();
-        } else {
-            int totalLines = getTotalLines();
-            int visibleLines = getVisibleLines();
-            int maxScroll = Math.max(0, totalLines - visibleLines);
-
-            scrollOffset += verticalAmount > 0 ? 3 : -3;
-            scrollOffset = Math.max(0, Math.min(scrollOffset, maxScroll));
-        }
-        return true;
     }
 
     private void scrollToBottom() {
         scrollOffset = 0;
     }
 
-    private void shutdownReaders() {
-        if (readersStarted) {
-            executorService.shutdownNow();
-            readersStarted = false;
+    public void scroll(int direction, int terminalHeight) {
+        if (direction > 0) {
+            if (scrollOffset < getTotalLines() - getVisibleLines(terminalHeight)) {
+                scrollOffset += SCROLL_STEP;
+            }
+        } else if (direction < 0) {
+            if (scrollOffset > 0) {
+                scrollOffset -= SCROLL_STEP;
+            }
         }
+        int totalLines = getTotalLines();
+        int visibleLines = getVisibleLines(terminalHeight);
+        scrollOffset = Math.max(0, Math.min(scrollOffset, totalLines - visibleLines));
     }
 
-    public void shutdownTerminal() {
+    public void shutdown() {
+        isRunning = false;
         if (terminalProcess != null && terminalProcess.isAlive()) {
             terminalProcess.destroy();
             terminalProcess = null;
         }
-
-        synchronized (terminalOutput) {
-            terminalOutput.setLength(0);
-            saveTerminalOutput();
-        }
-
-        try {
-            Files.deleteIfExists(Paths.get(COMMAND_HISTORY_FILE));
-            Files.deleteIfExists(Paths.get(TERMINAL_OUTPUT_FILE));
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-
-        shutdownReaders();
+        executorService.shutdownNow();
     }
 
-    @Override
-    public void close() {
-        super.close();
-        remotelyClient.onTerminalScreenClosed();
+    public void saveTerminalOutput(Path path) {
+        try {
+            Files.write(path, terminalOutput.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        } catch (IOException e) {
+            appendOutput("Failed to save terminal output: " + e.getMessage() + "\n");
+        }
+    }
+
+    public void loadTerminalOutput(Path path) {
+        try {
+            String content = new String(Files.readAllBytes(path), StandardCharsets.UTF_8);
+            synchronized (terminalOutput) {
+                terminalOutput.append(content);
+            }
+        } catch (IOException e) {
+            appendOutput("Failed to load terminal output: " + e.getMessage() + "\n");
+        }
     }
 
     private static class StyleTextPair {
