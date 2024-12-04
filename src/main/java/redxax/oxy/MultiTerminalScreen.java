@@ -1,6 +1,5 @@
 package redxax.oxy;
 
-import com.jcraft.jsch.*;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
@@ -41,6 +40,7 @@ public class MultiTerminalScreen extends Screen {
 
     private long lastRenameBlinkTime = 0;
     private boolean renameCursorVisible = true;
+    private long lastRenameInputTime = 0;
 
     private boolean closedViaEscape = false;
 
@@ -145,7 +145,7 @@ public class MultiTerminalScreen extends Screen {
     @Override
     public void render(DrawContext context, int mouseX, int mouseY, float delta) {
         this.renderBackground(context, mouseX, mouseY, delta);
-        renderTabs(context);
+        super.render(context, mouseX, mouseY, delta);
         if (!warningMessage.isEmpty()) {
             context.drawText(minecraftClient.textRenderer, Text.literal(warningMessage), 10, TAB_HEIGHT + 10, 0xFFAA0000, false);
             warningMessage = "";
@@ -154,79 +154,36 @@ public class MultiTerminalScreen extends Screen {
             TerminalInstance activeTerminal = terminals.get(activeTerminalIndex);
             activeTerminal.render(context, mouseX, mouseY, delta, this.width, this.height, scale);
         }
-        super.render(context, mouseX, mouseY, delta);
-    }
-
-    private void renderTabs(DrawContext context) {
-        for (int i = 0; i < terminals.size(); i++) {
-            int x = 10 + i * TAB_WIDTH;
-            int y = 5;
-            int width = TAB_WIDTH - 10;
-            int height = TAB_HEIGHT - 10;
-
-            if (i == activeTerminalIndex) {
-                context.fill(x - 2, y - 2, x + width + 2, y + height + 2, 0xFFAAAAAA);
-            }
-
-            context.fill(x, y, x + width, y + height, 0xFFCCCCCC);
-            String tabLabel = tabNames.get(i);
-            if (isRenaming && renamingTabIndex == i) {
-                String renameText = renameBuffer.toString();
-                context.drawText(minecraftClient.textRenderer, Text.literal(renameText), x + TAB_PADDING, y + 8, 0x000000, false);
-                int textWidth = minecraftClient.textRenderer.getWidth(renameText);
-                int cursorXPos = x + TAB_PADDING + textWidth;
-                int cursorYPos = y + 8;
-                if (System.currentTimeMillis() - lastRenameBlinkTime > 500) {
-                    renameCursorVisible = !renameCursorVisible;
-                    lastRenameBlinkTime = System.currentTimeMillis();
-                }
-                if (renameCursorVisible) {
-                    context.fill(cursorXPos, cursorYPos, cursorXPos + 1, cursorYPos + minecraftClient.textRenderer.fontHeight, 0xFF000000);
-                }
-            } else {
-                context.drawText(minecraftClient.textRenderer, Text.literal(tabLabel), x + TAB_PADDING, y + 8, 0x000000, false);
-            }
-        }
     }
 
     @Override
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
-        for (int i = 0; i < terminals.size(); i++) {
-            int tabX = 10 + i * TAB_WIDTH;
-            int tabY = 5;
-            int tabWidth = TAB_WIDTH - 10;
-            int tabHeight = TAB_HEIGHT - 10;
-
-            if (mouseX >= tabX && mouseX <= tabX + tabWidth && mouseY >= tabY && mouseY <= tabY + tabHeight) {
-                if (button == GLFW.GLFW_MOUSE_BUTTON_LEFT) {
-                    setActiveTerminal(i);
-                    return true;
-                } else if (button == GLFW.GLFW_MOUSE_BUTTON_MIDDLE) {
-                    closeTerminal(i);
-                    return true;
-                } else if (button == GLFW.GLFW_MOUSE_BUTTON_RIGHT) {
-                    initiateTabRename(i);
-                    return true;
-                }
-            }
-        }
-
-        int addButtonX = 10 + terminals.size() * TAB_WIDTH;
-        if (mouseX >= addButtonX && mouseX <= addButtonX + ADD_TAB_BUTTON_WIDTH
-                && mouseY >= 5 && mouseY <= 5 + TAB_HEIGHT - 10) {
-            if (button == GLFW.GLFW_MOUSE_BUTTON_LEFT) {
-                addNewTerminal();
-                return true;
-            }
-        }
-
         if (!terminals.isEmpty()) {
             TerminalInstance activeTerminal = terminals.get(activeTerminalIndex);
             if (activeTerminal.mouseClicked(mouseX, mouseY, button)) {
                 return true;
             }
         }
-
+        int tabY = 5;
+        int tabHeight = TAB_HEIGHT - 10;
+        int tabWidth = TAB_WIDTH - 10;
+        for (int i = 0; i < terminals.size(); i++) {
+            int tabX = 10 + i * TAB_WIDTH;
+            if (mouseX >= tabX && mouseX <= tabX + tabWidth && mouseY >= tabY && mouseY <= tabY + tabHeight) {
+                if (button == 1) {
+                    initiateTabRename(i);
+                    return true;
+                } else if (button == 2) {
+                    closeTerminal(i);
+                    return true;
+                } else if (button == 0) {
+                    if (!isRenaming) {
+                        setActiveTerminal(i);
+                        return true;
+                    }
+                }
+            }
+        }
         return super.mouseClicked(mouseX, mouseY, button);
     }
 
@@ -257,6 +214,7 @@ public class MultiTerminalScreen extends Screen {
         renamingTabIndex = tabIndex;
         renameBuffer.setLength(0);
         renameBuffer.append(tabNames.get(tabIndex));
+        lastRenameInputTime = System.currentTimeMillis();
         refreshTabButtons();
     }
 
@@ -332,6 +290,7 @@ public class MultiTerminalScreen extends Screen {
         }
 
         if (isRenaming) {
+            lastRenameInputTime = System.currentTimeMillis();
             if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
                 isRenaming = false;
                 renamingTabIndex = -1;
@@ -352,6 +311,8 @@ public class MultiTerminalScreen extends Screen {
                     refreshTabButtons();
                 }
                 return true;
+            } else if (keyCode == GLFW.GLFW_KEY_LEFT || keyCode == GLFW.GLFW_KEY_RIGHT) {
+                return true;
             }
             return true;
         }
@@ -366,6 +327,7 @@ public class MultiTerminalScreen extends Screen {
     @Override
     public boolean charTyped(char chr, int keyCode) {
         if (isRenaming && renamingTabIndex != -1) {
+            lastRenameInputTime = System.currentTimeMillis();
             if (chr == '\r') {
                 String newName = renameBuffer.toString().trim();
                 if (!newName.isEmpty()) {
@@ -374,6 +336,12 @@ public class MultiTerminalScreen extends Screen {
                 isRenaming = false;
                 renamingTabIndex = -1;
                 refreshTabButtons();
+                return true;
+            } else if (chr == '\b') {
+                if (renameBuffer.length() > 0) {
+                    renameBuffer.deleteCharAt(renameBuffer.length() - 1);
+                    refreshTabButtons();
+                }
                 return true;
             } else {
                 renameBuffer.append(chr);

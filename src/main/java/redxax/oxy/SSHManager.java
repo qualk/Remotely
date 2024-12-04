@@ -3,8 +3,11 @@ package redxax.oxy;
 import com.jcraft.jsch.*;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.ArrayList;
+import java.util.List;
 
 public class SSHManager {
 
@@ -17,6 +20,13 @@ public class SSHManager {
     private String sshPassword = "";
     private final TerminalInstance terminalInstance;
     private final ExecutorService executorService = Executors.newFixedThreadPool(2);
+
+    private boolean isMinecraftServerDetected = false;
+    private boolean isMinecraftServerLoaded = false;
+
+    private List<String> remoteCommandsCache = new ArrayList<>();
+    private long remoteCommandsLastFetched = 0;
+    private static final long REMOTE_COMMANDS_CACHE_DURATION = 60 * 1000;
 
     public SSHManager(TerminalInstance terminalInstance) {
         this.terminalInstance = terminalInstance;
@@ -85,10 +95,52 @@ public class SSHManager {
             while (isSSH && (line = sshReader.readLine()) != null) {
                 line = line.replace("\u0000", "").replace("\r", "");
                 terminalInstance.appendOutput(line + "\n");
+                if (!isMinecraftServerDetected) {
+                    if (line.contains("Starting minecraft server")) {
+                        isMinecraftServerDetected = true;
+                    }
+                } else if (!isMinecraftServerLoaded) {
+                    if (line.contains("Done") && line.contains("For help, type \"help\"")) {
+                        isMinecraftServerLoaded = true;
+                        fetchMinecraftServerCommands();
+                    }
+                }
             }
         } catch (IOException e) {
             terminalInstance.appendOutput("Error reading SSH output: " + e.getMessage() + "\n");
         }
+    }
+
+    private void fetchMinecraftServerCommands() {
+        executorService.submit(() -> {
+            try {
+                sshWriter.write("help\n");
+                sshWriter.flush();
+                List<String> commands = new ArrayList<>();
+                boolean readingCommands = false;
+                String line;
+                while ((line = sshReader.readLine()) != null) {
+                    line = line.replace("\u0000", "").replace("\r", "");
+                    if (line.startsWith("----")) {
+                        readingCommands = !readingCommands;
+                        continue;
+                    }
+                    if (readingCommands) {
+                        String cmd = line.trim().split(" ")[0];
+                        commands.add(cmd);
+                    }
+                    if (line.contains("For help, type \"help\"")) {
+                        break;
+                    }
+                }
+                synchronized (this) {
+                    remoteCommandsCache = commands;
+                    remoteCommandsLastFetched = System.currentTimeMillis();
+                }
+            } catch (IOException e) {
+                terminalInstance.appendOutput("Failed to fetch Minecraft server commands: " + e.getMessage() + "\n");
+            }
+        });
     }
 
     public void shutdown() {
@@ -123,6 +175,51 @@ public class SSHManager {
 
     public Writer getSshWriter() {
         return sshWriter;
+    }
+
+    public List<String> getSSHCommands(String prefix) {
+        synchronized (this) {
+            if (System.currentTimeMillis() - remoteCommandsLastFetched < REMOTE_COMMANDS_CACHE_DURATION) {
+                List<String> result = new ArrayList<>();
+                for (String cmd : remoteCommandsCache) {
+                    if (cmd.startsWith(prefix)) {
+                        result.add(cmd);
+                    }
+                }
+                return result;
+            }
+        }
+        try {
+            return fetchRemoteCommands(prefix);
+        } catch (Exception e) {
+            terminalInstance.appendOutput("Error fetching remote commands: " + e.getMessage() + "\n");
+            return new ArrayList<>();
+        }
+    }
+
+    private List<String> fetchRemoteCommands(String prefix) throws Exception {
+        ChannelExec channelExec = (ChannelExec) sshSession.openChannel("exec");
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        channelExec.setOutputStream(baos);
+        channelExec.setCommand("compgen -c");
+        channelExec.connect();
+        while (!channelExec.isClosed()) {
+            Thread.sleep(100);
+        }
+        channelExec.disconnect();
+        String output = baos.toString(StandardCharsets.UTF_8.name());
+        String[] commands = output.split("\\s+");
+        List<String> result = new ArrayList<>();
+        for (String cmd : commands) {
+            if (cmd.startsWith(prefix)) {
+                result.add(cmd);
+            }
+        }
+        synchronized (this) {
+            remoteCommandsCache = Arrays.asList(commands);
+            remoteCommandsLastFetched = System.currentTimeMillis();
+        }
+        return result;
     }
 
     private class SSHUserInfo implements UserInfo {
