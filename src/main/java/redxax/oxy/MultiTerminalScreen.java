@@ -181,7 +181,7 @@ public class MultiTerminalScreen extends Screen {
                     lastRenameBlinkTime = System.currentTimeMillis();
                 }
                 if (renameCursorVisible) {
-                    context.fill(cursorXPos, cursorYPos, cursorXPos + 1, cursorYPos + 9, 0xFF000000);
+                    context.fill(cursorXPos, cursorYPos, cursorXPos + 1, cursorYPos + minecraftClient.textRenderer.fontHeight, 0xFF000000);
                 }
             } else {
                 context.drawText(minecraftClient.textRenderer, Text.literal(tabLabel), x + TAB_PADDING, y + 8, 0x000000, false);
@@ -222,12 +222,34 @@ public class MultiTerminalScreen extends Screen {
 
         if (!terminals.isEmpty()) {
             TerminalInstance activeTerminal = terminals.get(activeTerminalIndex);
-            if (activeTerminal.mouseClicked(mouseX, mouseY, button, this.width, this.height, scale)) {
+            if (activeTerminal.mouseClicked(mouseX, mouseY, button)) {
                 return true;
             }
         }
 
         return super.mouseClicked(mouseX, mouseY, button);
+    }
+
+    @Override
+    public boolean mouseReleased(double mouseX, double mouseY, int button) {
+        if (!terminals.isEmpty()) {
+            TerminalInstance activeTerminal = terminals.get(activeTerminalIndex);
+            if (activeTerminal.mouseReleased(mouseX, mouseY, button)) {
+                return true;
+            }
+        }
+        return super.mouseReleased(mouseX, mouseY, button);
+    }
+
+    @Override
+    public boolean mouseDragged(double mouseX, double mouseY, int button, double deltaX, double deltaY) {
+        if (!terminals.isEmpty()) {
+            TerminalInstance activeTerminal = terminals.get(activeTerminalIndex);
+            if (activeTerminal.mouseDragged(mouseX, mouseY, button, deltaX, deltaY)) {
+                return true;
+            }
+        }
+        return super.mouseDragged(mouseX, mouseY, button, deltaX, deltaY);
     }
 
     private void initiateTabRename(int tabIndex) {
@@ -236,28 +258,6 @@ public class MultiTerminalScreen extends Screen {
         renameBuffer.setLength(0);
         renameBuffer.append(tabNames.get(tabIndex));
         refreshTabButtons();
-    }
-
-    @Override
-    public boolean mouseDragged(double mouseX, double mouseY, int button, double deltaX, double deltaY) {
-        if (!terminals.isEmpty()) {
-            TerminalInstance activeTerminal = terminals.get(activeTerminalIndex);
-            if (activeTerminal.mouseDragged(mouseX, mouseY, button, deltaX, deltaY, this.width, this.height, scale)) {
-                return true;
-            }
-        }
-        return super.mouseDragged(mouseX, mouseY, button, deltaX, deltaY);
-    }
-
-    @Override
-    public boolean mouseReleased(double mouseX, double mouseY, int button) {
-        if (!terminals.isEmpty()) {
-            TerminalInstance activeTerminal = terminals.get(activeTerminalIndex);
-            if (activeTerminal.mouseReleased(mouseX, mouseY, button, this.width, this.height, scale)) {
-                return true;
-            }
-        }
-        return super.mouseReleased(mouseX, mouseY, button);
     }
 
     @Override
@@ -374,12 +374,6 @@ public class MultiTerminalScreen extends Screen {
                 isRenaming = false;
                 renamingTabIndex = -1;
                 refreshTabButtons();
-                return true;
-            } else if (chr == '\b') {
-                if (renameBuffer.length() > 0) {
-                    renameBuffer.deleteCharAt(renameBuffer.length() - 1);
-                    refreshTabButtons();
-                }
                 return true;
             } else {
                 renameBuffer.append(chr);
