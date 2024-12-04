@@ -71,7 +71,6 @@ public class TerminalRenderer {
         context.getMatrices().translate(textAreaX, textAreaY, 0);
         context.getMatrices().scale(this.scale, this.scale, 1.0f);
 
-        float currentScale = Math.max(this.scale, MIN_SCALE);
         int scaledWidth = (int) (textAreaWidth / this.scale);
         int scaledHeight = (int) (textAreaHeight / this.scale);
         int x = 0;
@@ -80,7 +79,15 @@ public class TerminalRenderer {
 
         synchronized (terminalOutput) {
             String[] lines = terminalOutput.toString().split("\n", -1);
-            int totalLines = lines.length;
+            List<LineText> allWrappedLines = new ArrayList<>();
+
+            for (String line : lines) {
+                List<StyleTextPair> segments = parseAnsiAndHighlight(line);
+                List<LineText> wrappedLines = wrapStyledText(segments, maxWidth);
+                allWrappedLines.addAll(wrappedLines);
+            }
+
+            int totalLines = allWrappedLines.size();
             int visibleLines = getVisibleLines(scaledHeight);
 
             scrollOffset = Math.min(scrollOffset, Math.max(0, totalLines - visibleLines));
@@ -91,28 +98,18 @@ public class TerminalRenderer {
             lineInfos.clear();
             urlInfos.clear();
 
-            int globalLineIndex = 0;
+            for (int i = startLine; i < endLine; i++) {
+                LineText lineText = allWrappedLines.get(i);
+                int lineHeight = minecraftClient.textRenderer.fontHeight;
+                LineInfo lineInfo = new LineInfo(i, yStart, lineHeight, lineText.orderedText, lineText.plainText);
+                lineInfos.add(lineInfo);
 
-            for (int i = 0; i < totalLines; i++) {
-                String line = lines[i];
-                List<StyleTextPair> segments = parseAnsiAndHighlight(line);
-                List<LineText> wrappedLines = wrapStyledText(segments, maxWidth);
-
-                for (LineText lineText : wrappedLines) {
-                    if (globalLineIndex >= startLine && globalLineIndex < endLine) {
-                        int lineHeight = minecraftClient.textRenderer.fontHeight;
-                        LineInfo lineInfo = new LineInfo(globalLineIndex, yStart, lineHeight, lineText.orderedText, lineText.plainText);
-                        lineInfos.add(lineInfo);
-
-                        if (isLineSelected(globalLineIndex)) {
-                            drawSelection(context, lineInfo, x);
-                        }
-
-                        context.drawText(minecraftClient.textRenderer, lineText.orderedText, x, yStart, 0xFFFFFFFF, false);
-                        yStart += lineHeight;
-                    }
-                    globalLineIndex++;
+                if (isLineSelected(i)) {
+                    drawSelection(context, lineInfo, x);
                 }
+
+                context.drawText(minecraftClient.textRenderer, lineText.orderedText, x, yStart, 0xFFFFFFFF, false);
+                yStart += lineHeight;
             }
         }
 
@@ -156,26 +153,33 @@ public class TerminalRenderer {
     }
 
     private List<StyleTextPair> parseAnsiAndHighlight(String text) {
+        text = text.replace("\r", "");
+
         List<StyleTextPair> result = new ArrayList<>();
         List<StyleTextPair> styledSegments = parseAnsiCodes(text);
+
         for (StyleTextPair segment : styledSegments) {
             Matcher urlMatcher = URL_PATTERN.matcher(segment.text);
             int lastEnd = 0;
+
             while (urlMatcher.find()) {
                 if (urlMatcher.start() > lastEnd) {
                     String before = segment.text.substring(lastEnd, urlMatcher.start());
                     result.add(new StyleTextPair(segment.style, null, before));
                 }
+
                 String url = urlMatcher.group(1);
                 Style urlStyle = segment.style.withFormatting(Formatting.UNDERLINE).withColor(TextColor.fromRgb(0x00AAFF));
                 result.add(new StyleTextPair(urlStyle, null, url, url));
                 lastEnd = urlMatcher.end();
             }
+
             if (lastEnd < segment.text.length()) {
                 String remaining = segment.text.substring(lastEnd);
                 result.add(new StyleTextPair(segment.style, null, remaining));
             }
         }
+
         return result;
     }
 
@@ -461,23 +465,22 @@ public class TerminalRenderer {
         }
     }
 
-    private int getTotalLines() {
+    private int getTotalLines(int maxWidth) {
         synchronized (terminalOutput) {
             String[] lines = terminalOutput.toString().split("\n", -1);
             int totalWrappedLines = 0;
             for (String line : lines) {
                 List<StyleTextPair> segments = parseAnsiAndHighlight(line);
-                List<LineText> wrappedLines = wrapStyledText(segments, minecraftClient.textRenderer.getWidth(line));
+                List<LineText> wrappedLines = wrapStyledText(segments, maxWidth);
                 totalWrappedLines += wrappedLines.size();
             }
             return totalWrappedLines;
         }
     }
 
-    private int getVisibleLines(int terminalHeight) {
-        float safeScale = Math.max(scale, MIN_SCALE);
-        int visibleHeight = Math.max(terminalHeight - getInputFieldHeight(), 1);
-        return Math.max((int) (visibleHeight / (minecraftClient.textRenderer.fontHeight * safeScale)), 1);
+    private int getVisibleLines(int scaledHeight) {
+        int visibleHeight = Math.max(scaledHeight - getInputFieldHeight(), 1);
+        return Math.max(visibleHeight / minecraftClient.textRenderer.fontHeight, 1);
     }
 
     int getInputFieldHeight() {
@@ -485,16 +488,18 @@ public class TerminalRenderer {
     }
 
     public void appendOutput(String text) {
+        // Remove carriage return characters to prevent unwanted symbols
+        text = text.replace("\r", "");
         synchronized (terminalOutput) {
             terminalOutput.append(text);
         }
         lineInfos.clear();
         minecraftClient.execute(() -> terminalInstance.parentScreen.init());
     }
-
-    public void scroll(int direction, int terminalHeight) {
-        int totalLines = getTotalLines();
-        int visibleLines = getVisibleLines(terminalHeight);
+    public void scroll(int direction, int scaledHeight) {
+        int maxWidth = (int) ((terminalWidth - 10) / scale);
+        int totalLines = getTotalLines(maxWidth);
+        int visibleLines = getVisibleLines(scaledHeight);
         if (direction > 0) {
             if (scrollOffset < totalLines - visibleLines) {
                 scrollOffset += MultiTerminalScreen.SCROLL_STEP;
@@ -507,9 +512,10 @@ public class TerminalRenderer {
         scrollOffset = Math.max(0, Math.min(scrollOffset, totalLines - visibleLines));
     }
 
-    public void scrollToTop(int terminalHeight) {
-        int totalLines = getTotalLines();
-        int visibleLines = getVisibleLines(terminalHeight);
+    public void scrollToTop(int scaledHeight) {
+        int maxWidth = (int) ((terminalWidth - 10) / scale);
+        int totalLines = getTotalLines(maxWidth);
+        int visibleLines = getVisibleLines(scaledHeight);
         scrollOffset = totalLines - visibleLines;
         scrollOffset = Math.max(0, scrollOffset);
     }

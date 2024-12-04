@@ -220,7 +220,7 @@ public class InputHandler {
         if (keyCode == GLFW.GLFW_KEY_TAB) {
             handleTabCompletion();
             terminalInstance.renderer.resetCursorBlink();
-            return true;
+            return true; // Consume the Tab key event
         }
 
         if (keyCode == GLFW.GLFW_KEY_C && ctrlHeld) {
@@ -373,7 +373,6 @@ public class InputHandler {
 
         return false;
     }
-
     private void updateCurrentDirectoryFromCommand(String command) {
         if (command.startsWith("cd ")) {
             String path = command.substring(3).trim();

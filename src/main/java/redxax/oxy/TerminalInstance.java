@@ -77,9 +77,6 @@ public class TerminalInstance {
         renderer.appendOutput(text);
     }
 
-    public void handleTabCompletion() {
-        inputHandler.handleTabCompletion();
-    }
 
     public List<String> getCommandHistory() {
         return parentScreen.commandHistory;
