@@ -6,7 +6,7 @@ on: [ push ]
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         java: [ 21 ]
@@ -42,7 +42,7 @@ jobs:
           path: build/libs/*.jar
 
   dependency-submission:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
 
